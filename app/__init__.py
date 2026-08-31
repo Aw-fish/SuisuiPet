@@ -1,0 +1,1 @@
+"""SuisuiPet application package."""
