@@ -2,7 +2,7 @@
 from __future__ import annotations
 import random
 from typing import Callable
-from PySide6.QtCore import QPropertyAnimation, QPoint, QTimer, Qt
+from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QTimer, Qt
 from PySide6.QtGui import QColor, QContextMenuEvent, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 from app.config import load_settings, save_settings
@@ -10,28 +10,43 @@ from app.config import load_settings, save_settings
 
 class ChatDialog(QDialog):
     def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent); self.drag: QPoint | None = None; self.setFixedSize(360, 430); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool); self.setAttribute(Qt.WA_TranslucentBackground)
-        root = QFrame(objectName="chatRoot"); outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(root)
-        layout = QVBoxLayout(root); layout.setContentsMargins(16, 16, 16, 16); layout.setSpacing(10)
+        super().__init__(parent)
+        self.drag: QPoint | None = None
+        self.setFixedSize(360, 430)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        root = QFrame(objectName="chatRoot")
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(root)
+        layout = QVBoxLayout(root); layout.setContentsMargins(16, 10, 16, 16); layout.setSpacing(10)
+        self.drag_bar = QFrame(objectName="dragBar"); self.drag_bar.setFixedHeight(28); self.drag_bar.setCursor(Qt.OpenHandCursor); self.drag_bar.installEventFilter(self)
+        bar = QHBoxLayout(self.drag_bar); bar.setContentsMargins(0, 0, 0, 0); bar.addStretch()
+        close = QPushButton("×", objectName="chatClose"); close.clicked.connect(self.hide); bar.addWidget(close); layout.addWidget(self.drag_bar)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame)
         self.messages = QWidget(); self.history = QVBoxLayout(self.messages); self.history.setContentsMargins(2, 2, 2, 2); self.history.addStretch(); self.scroll.setWidget(self.messages); layout.addWidget(self.scroll, 1)
         row = QHBoxLayout(); self.input = QLineEdit(placeholderText="和碎碎说点什么……"); send = QPushButton("发送", objectName="send"); send.clicked.connect(self.send); row.addWidget(self.input, 1); row.addWidget(send); layout.addLayout(row)
-        self.setStyleSheet('QFrame#chatRoot { background: rgba(255,255,255,232); border:1px solid #EAE6F2; border-radius:16px; } QScrollArea { background:transparent; } QLineEdit { border:1px solid #E8E5F0; background:rgba(255,255,255,220); border-radius:10px; padding:9px; } QPushButton#send { background:#917DE8; color:white; border:0; border-radius:10px; padding:9px 15px; } QPushButton#chatClose { border:0; background:transparent; color:#A39CAD; font-size:17px; min-width:24px; max-width:24px; } QPushButton#chatClose:hover { color:#685D78; background:#F4F1FA; border-radius:8px; } QLabel#petMsg { background:#F7F5FB; color:#4C4759; border-radius:12px; padding:9px 12px; } QLabel#userMsg { background:#EEEAFE; color:#51457B; border-radius:12px; padding:9px 12px; }')
+        self.setStyleSheet('QDialog { background: transparent; } QFrame#chatRoot { background: #FFFFFF; border:1px solid #EAE6F2; border-radius:16px; } QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; } QLineEdit { border:1px solid #E8E5F0; background:rgba(255,255,255,220); border-radius:10px; padding:9px; } QPushButton#send { background:#917DE8; color:white; border:0; border-radius:10px; padding:9px 15px; } QPushButton#chatClose { border:0; background:transparent; color:#A39CAD; font-size:17px; min-width:24px; max-width:24px; } QPushButton#chatClose:hover { color:#685D78; background:#F4F1FA; border-radius:8px; } QLabel#petMsg { background:#F7F5FB; color:#4C4759; border-radius:12px; padding:9px 12px; } QLabel#userMsg { background:#EEEAFE; color:#51457B; border-radius:12px; padding:9px 12px; }')
         self.add("你好，我是碎碎。", False)
 
     def add(self, text: str, user: bool) -> None:
-        label = QLabel(text, objectName="userMsg" if user else "petMsg"); label.setWordWrap(True); label.setMaximumWidth(245)
-        row = QHBoxLayout(); row.addWidget(label, alignment=Qt.AlignRight if user else Qt.AlignLeft); self.history.insertLayout(self.history.count() - 1, row)
+        label = QLabel(text, objectName="userMsg" if user else "petMsg")
+        label.setWordWrap(True); label.setMaximumWidth(306); label.setMinimumWidth(36)
+        label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        row = QHBoxLayout()
+        if user: row.addStretch(); row.addWidget(label)
+        else: row.addWidget(label); row.addStretch()
+        self.history.insertLayout(self.history.count() - 1, row)
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton: self.drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.drag and event.buttons() & Qt.LeftButton: self.move(event.globalPosition().toPoint() - self.drag)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton: self.drag = None
+    def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
+        if watched is self.drag_bar:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft(); self.drag_bar.setCursor(Qt.ClosedHandCursor); return True
+            if event.type() == QEvent.MouseMove and self.drag and event.buttons() & Qt.LeftButton:
+                self.move(event.globalPosition().toPoint() - self.drag); return True
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.drag = None; self.drag_bar.setCursor(Qt.OpenHandCursor); return True
+        return super().eventFilter(watched, event)
 
     def send(self) -> None:
         text = self.input.text().strip()
@@ -71,7 +86,7 @@ class PetWindow(QWidget):
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
         d=load_settings(); movable=d['motion']['mode']=='movable'; m=QMenu(self); m.setStyleSheet('QMenu { background:white; border:1px solid #E9E5F1; border-radius:10px; padding:6px; } QMenu::item { padding:8px 34px 8px 12px; border-radius:7px; } QMenu::item:selected { background:#F0EDFB; color:#6D5DC0; }')
-        a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator(); a=m.addAction('打开对话框'); a.triggered.connect(lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.tick.isActive() else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.tick.isActive() else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings); m.exec(e.globalPos())
+        a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator(); a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.tick.isActive() else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.tick.isActive() else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings); m.exec(e.globalPos())
     def mousePressEvent(self,e:QMouseEvent)->None:
         if e.button()==Qt.LeftButton: self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft()
     def mouseMoveEvent(self,e:QMouseEvent)->None:
@@ -82,7 +97,11 @@ class PetWindow(QWidget):
         if hasattr(self,'timer_window') and self.timer_window.isVisible(): self.timer_window.place()
     def toggle_mode(self)->None:
         d=load_settings(); d['motion']['mode']='stationary' if d['motion']['mode']=='movable' else 'movable'; save_settings(d); self.refresh_settings(d); self.say('固定模式' if d['motion']['mode']=='stationary' else '自由模式')
-    def apply_settings(self, data:dict)->None: self.say('设置已保存')
+    def apply_settings(self, data:dict)->None:
+        if data['conversation']['show_floating_dialog']: self.chat.show_near(self)
+        else: self.close_chat()
+        self.say('设置已保存')
+    def close_chat(self)->None: self.chat.hide()
     def start_pomodoro(self)->None:
         self.remaining=load_settings()['tools']['pomodoro_minutes']*60; self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.say('开始专注')
     def stop_pomodoro(self)->None: self.tick.stop(); self.timer_window.hide(); self.say('番茄钟已停止')
@@ -94,4 +113,7 @@ class PetWindow(QWidget):
         if load_settings()['motion']['mode']!='movable' or self.drag or random.random()>.28:return
         self.canvas.act(); area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-70,70))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-35,35)))); self.animation=QPropertyAnimation(self,b'pos',self); self.animation.setDuration(650); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
     def say(self,text:str,duration:int=2300)->None: self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide)
+
+
+
 
