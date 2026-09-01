@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Callable
 from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QTimer, Qt
-from PySide6.QtGui import QColor, QContextMenuEvent, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import QColor, QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 from app.config import load_settings, save_settings
 
@@ -21,16 +21,18 @@ class ChatDialog(QDialog):
         self.drag_bar = QFrame(objectName="dragBar"); self.drag_bar.setFixedHeight(28); self.drag_bar.setCursor(Qt.OpenHandCursor); self.drag_bar.installEventFilter(self)
         bar = QHBoxLayout(self.drag_bar); bar.setContentsMargins(0, 0, 0, 0); bar.addStretch()
         close = QPushButton("×", objectName="chatClose"); close.clicked.connect(self.hide); bar.addWidget(close); layout.addWidget(self.drag_bar)
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame); self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.messages = QWidget(); self.history = QVBoxLayout(self.messages); self.history.setContentsMargins(2, 2, 2, 2); self.history.addStretch(); self.scroll.setWidget(self.messages); layout.addWidget(self.scroll, 1)
-        row = QHBoxLayout(); self.input = QLineEdit(placeholderText="和碎碎说点什么……"); send = QPushButton("发送", objectName="send"); send.clicked.connect(self.send); row.addWidget(self.input, 1); row.addWidget(send); layout.addLayout(row)
+        row = QHBoxLayout(); self.input = QLineEdit(placeholderText="说点什么……"); send = QPushButton("发送", objectName="send"); send.clicked.connect(self.send); row.addWidget(self.input, 1); row.addWidget(send); layout.addLayout(row)
         self.setStyleSheet('QDialog { background: transparent; } QFrame#chatRoot { background: #FFFFFF; border:1px solid #EAE6F2; border-radius:16px; } QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; } QLineEdit { border:1px solid #E8E5F0; background:rgba(255,255,255,220); border-radius:10px; padding:9px; } QPushButton#send { background:#917DE8; color:white; border:0; border-radius:10px; padding:9px 15px; } QPushButton#chatClose { border:0; background:transparent; color:#A39CAD; font-size:17px; min-width:24px; max-width:24px; } QPushButton#chatClose:hover { color:#685D78; background:#F4F1FA; border-radius:8px; } QLabel#petMsg { background:#F7F5FB; color:#4C4759; border-radius:12px; padding:9px 12px; } QLabel#userMsg { background:#EEEAFE; color:#51457B; border-radius:12px; padding:9px 12px; }')
-        self.add("你好，我是碎碎。", False)
+
 
     def add(self, text: str, user: bool) -> None:
         label = QLabel(text, objectName="userMsg" if user else "petMsg")
-        label.setWordWrap(True); label.setMaximumWidth(306); label.setMinimumWidth(36)
-        label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        label.setWordWrap(True)
+        content_width = QFontMetrics(label.font()).horizontalAdvance(text) + 25
+        label.setFixedWidth(min(306, max(72, content_width)))
+        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         row = QHBoxLayout()
         if user: row.addStretch(); row.addWidget(label)
@@ -50,10 +52,10 @@ class ChatDialog(QDialog):
 
     def send(self) -> None:
         text = self.input.text().strip()
-        if text: self.add(text, True); self.add("我收到了。连接 AI 后，我会认真回答你。", False); self.input.clear()
+        if text: self.add(text, True); self.add("已收到信息，此时显示测试文本123123。", False); self.input.clear()
 
     def show_near(self, pet: QWidget) -> None:
-        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 14, 0)
+        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 30, 180)
         self.move(max(area.left() + 8, point.x()), max(area.top() + 8, point.y())); self.show(); self.raise_(); self.activateWindow()
 
 
@@ -92,11 +94,11 @@ class PetWindow(QWidget):
     def mouseMoveEvent(self,e:QMouseEvent)->None:
         if self.drag and e.buttons()&Qt.LeftButton: self.move(e.globalPosition().toPoint()-self.drag); self.timer_window.place()
     def mouseReleaseEvent(self,e:QMouseEvent)->None:
-        if e.button()==Qt.LeftButton: self.drag=None; self.say('已放好啦')
+        if e.button()==Qt.LeftButton: self.drag=None;
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
         if hasattr(self,'timer_window') and self.timer_window.isVisible(): self.timer_window.place()
     def toggle_mode(self)->None:
-        d=load_settings(); d['motion']['mode']='stationary' if d['motion']['mode']=='movable' else 'movable'; save_settings(d); self.refresh_settings(d); self.say('固定模式' if d['motion']['mode']=='stationary' else '自由模式')
+        d=load_settings(); d['motion']['mode']='stationary' if d['motion']['mode']=='movable' else 'movable'; save_settings(d); self.refresh_settings(d); self.say('固定位置' if d['motion']['mode']=='stationary' else '自由移动')
     def apply_settings(self, data:dict)->None:
         if data['conversation']['show_floating_dialog']: self.chat.show_near(self)
         else: self.close_chat()
@@ -108,11 +110,12 @@ class PetWindow(QWidget):
     def _timer_text(self)->None: self.timer_window.label.setText(f'{self.remaining//60:02d}:{self.remaining%60:02d}')
     def _tick(self)->None:
         self.remaining-=1; self._timer_text()
-        if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.say('专注完成，休息一下吧！',5000)
+        if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.say('专注完成！',5000)
     def _wander(self)->None:
         if load_settings()['motion']['mode']!='movable' or self.drag or random.random()>.28:return
         self.canvas.act(); area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-70,70))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-35,35)))); self.animation=QPropertyAnimation(self,b'pos',self); self.animation.setDuration(650); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
     def say(self,text:str,duration:int=2300)->None: self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide)
+
 
 
 

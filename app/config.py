@@ -11,7 +11,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = ROOT_DIR / "data" / "settings.json"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "character": {"selected": "Suisui（占位角色）"},
+    "character": {"selected": "Suisui"},
     "conversation": {
         "model": "",
         "api_key": "",
