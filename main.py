@@ -11,10 +11,13 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     settings = SettingsWindow()
-    pet = PetWindow(settings.show_from_tray)
+    pet = PetWindow(settings.show_from_tray, settings.apply_external_settings)
+    settings.settings_saved.connect(pet.apply_settings)
     pet.show()
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
+
+

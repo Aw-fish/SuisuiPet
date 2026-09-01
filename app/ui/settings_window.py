@@ -1,7 +1,7 @@
 """PySide6 settings window and system-tray integration."""
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, Qt
+from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFrame, QGraphicsOpacityEffect,
@@ -13,6 +13,7 @@ from app.config import load_settings, save_settings
 
 
 class SettingsWindow(QMainWindow):
+    settings_saved = Signal(dict)
     ACCENT = "#917DE8"
 
     def __init__(self) -> None:
@@ -156,7 +157,12 @@ class SettingsWindow(QMainWindow):
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
         save_settings(self.data)
-        self.tray.showMessage("SuisuiPet", "设置已保存", QSystemTrayIcon.Information, 1500)
+        self.settings_saved.emit(self.data)
+        self.hide()
+
+    def apply_external_settings(self, data: dict) -> None:
+        self.data = data
+        self._load()
 
     def _build_tray(self) -> None:
         pixmap = QPixmap(64, 64); pixmap.fill(Qt.transparent)
@@ -172,6 +178,8 @@ class SettingsWindow(QMainWindow):
         self.animation = QPropertyAnimation(effect, b"opacity", self); self.animation.setDuration(180); self.animation.setStartValue(.2); self.animation.setEndValue(1.0); self.animation.setEasingCurve(QEasingCurve.OutCubic); self.animation.start()
 
     def show_from_tray(self) -> None:
+        self.data = load_settings()
+        self._load()
         self.showNormal(); self.activateWindow(); self.raise_()
 
     def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
@@ -189,6 +197,10 @@ class SettingsWindow(QMainWindow):
     @classmethod
     def _qss(cls) -> str:
         return f'''QWidget#root {{ background:white; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:10px; }} QLineEdit,QComboBox,QSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }}'''
+
+
+
+
 
 
 
