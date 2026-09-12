@@ -5,13 +5,31 @@
 ## 运行
 
 ```bash
-pip install PySide6 Pillow
+pip install PySide6 Pillow requests
 python main.py
 ```
 
-- 桌宠默认出现在屏幕右下角，**右键角色**可打开功能菜单；托盘图标（紫色圆点）右键可打开设置。
 - 需要 Python 3.10+（代码使用了 `dict[str, Any]`、`X | None` 等写法）。
-- `Pillow` 仅用于重新生成占位素材的脚本，运行应用本身不需要。
+- 桌宠默认出现在屏幕右下角，**右键角色**可打开功能菜单；托盘图标右键可打开设置。
+- `Pillow` 只用于生成占位素材与图标的脚本，运行应用本身不需要。
+
+### 配置 API Key
+
+对话走 **OpenAI 兼容**接口（默认 DeepSeek）。Key 直接填在「设置 → 角色设置 → API Key」，
+随角色配置一起保存在 `data/characters/<角色名>/character.json`，方便本地随时修改。
+
+**`character.json` 已被 `.gitignore` 忽略**，Key 只存在于本机，不会随仓库上传：
+
+```gitignore
+data/characters/*            # 除示例角色外的角色目录
+!data/characters/default/
+data/characters/*/memory/    # 对话记忆
+data/characters/*/character.json   # 角色配置（含 API Key）
+```
+
+> 说明：gitignore 只能忽略整个文件，无法只忽略文件里的某个字段，所以是把
+> `character.json` 整体排除在版本控制之外。示例角色 `default` 只跟踪立绘，
+> 它的配置文件在首次运行时会按代码里的默认值自动生成。
 
 ## MVP 功能范围与实现进度（截至 2026-09-12）
 
@@ -31,11 +49,15 @@ python main.py
 ### 2. AI 对话
 
 - ✅ 可隐藏的浮动对话窗，消息气泡自适应宽度、自动滚底、标题栏可拖动。
-- ✅ 每个角色独立配置 `AI 模型名称 / API Key / 角色提示词`。
-- ⬜ **无真实 API 调用**：`ChatDialog.send()` 目前返回固定测试文本。
-- ⬜ 设置中缺少 **API 地址** 配置项。
-- ⬜ 已配置的模型 / Key / 提示词尚未被使用；无初始化与连通性测试、无流式输出、无错误处理。
-- ⬜ 无对话历史与上下文记忆。
+- ✅ **真实流式对话**：OpenAI 兼容接口（默认 DeepSeek），增量文本按 ~25fps 合并刷新。
+- ✅ **随时可打断**：生成中「发送」变「停止」，已生成的部分保留并标记 `interrupted`。
+- ✅ 生成中桌宠自动切到说话动作，结束后回到基础状态。
+- ✅ 输入框支持 `Enter` 发送、`Shift+Enter` 换行；出错时显示可直接读懂的提示。
+- ✅ 每个角色独立配置 `API 地址 / 模型名称 / 温度 / 上下文轮数 / 角色提示词`，并带「测试连接」。
+- ✅ API Key 只从环境变量读取，配置文件不落 Key。
+- ✅ **记忆**：会话日志 + 长期记忆摘要，重启后恢复最近对话。
+- ⬜ 工具调用（天气 / 时间 / 窗口视觉）尚未实现，接口已留好。
+- ⬜ 语音尚未实现，输出管线已预留句级切分信号。
 
 ### 3. 轻量实用助手
 
@@ -65,6 +87,14 @@ SuisuiPet/
 │   ├── paths.py                     # 共享路径常量
 │   ├── config.py                    # 全局设置（data/settings.json）读写与旧格式迁移
 │   ├── characters.py                # 角色目录的创建 / 导入 / 删除与配置读写
+│   ├── conversation/
+│   │   ├── service.py               # 对话编排（QThread 流式 + 打断 + 记忆落盘）
+│   │   ├── memory.py                # L1 上下文 / L2 会话日志 / L3 长期记忆
+│   │   ├── message.py               # 消息结构与落盘格式
+│   │   ├── sentence.py              # 句级切分（语音 TTS 的接入点）
+│   │   └── providers/
+│   │       ├── base.py              # Provider 抽象与 Chunk / ToolCall
+│   │       └── openai_compat.py     # OpenAI 兼容流式实现
 │   ├── pet/
 │   │   ├── character_sprite.py      # 扁平文件夹立绘扫描、兜底链、镜像、透明背景校验
 │   │   └── animator.py              # 帧播放驱动（基础状态 + 临时动作 + 固定表情）
@@ -79,8 +109,8 @@ SuisuiPet/
 │   ├── icon.png / icon.ico          # 应用与托盘图标（由 tools/make_icon.py 生成）
 │   ├── img/Default.png              # 源立绘，仅作为生成脚本的输入
 │   └── characters/<角色名>/
-│       ├── character.json           # 该角色的全部配置
-│       ├── sprites/                 # img 格式立绘
+│       ├── character.json           # 该角色的全部配置（含 API Key，不进版本控制）
+│       ├── sprites/                 # img 格式立绘（示例角色会被跟踪）
 │       └── memory/                  # 对话记忆（不进版本控制）
 └── tools/
     ├── make_placeholder_frames.py   # 从源立绘生成某个角色的占位素材
@@ -148,14 +178,19 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 
 ### 角色配置 `data/characters/<角色名>/character.json`
 
+> 这个文件**不进版本控制**（含 API Key），首次运行会按默认值生成。
+
 ```json
 {
   "name": "Suisui",
   "format": "img",
   "asset": "sprites",
   "asset_path": "",
-  "model": "",
+  "model": "deepseek-chat",
+  "base_url": "https://api.deepseek.com/v1",
   "api_key": "",
+  "temperature": 0.8,
+  "max_context_messages": 20,
   "system_prompt": "",
   "activity": 5
 }
@@ -164,8 +199,25 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 - `format`：`img`（立绘文件夹）/ `live2d`（模型 JSON）。
 - `asset`：img 格式的立绘目录，默认是角色目录下的 `sprites`。
 - `asset_path`：仅 live2d 使用，指向模型文件。
+- `base_url` / `model` / `api_key` / `temperature` / `max_context_messages` / `system_prompt`：对话参数，按角色独立保存。
+- `api_key`：只在本机使用，靠 `.gitignore` 排除，不会上传。
 - `activity`：1–10，数值越大则随机动作越频繁、移动距离越远（等级 1 约 9.0s / 3% / ±30px，等级 10 约 2.7s / 52.5% / ±138px）。
 - 角色设置页改的就是当前选中角色的这份配置，**点「保存设置」后写入**。
+
+### 对话记忆 `data/characters/<角色名>/memory/`
+
+```
+memory/
+├── profile.json      # L3 长期记忆：稳定事实与偏好，会渲染进 system prompt
+├── summary.md        # L3 早期对话摘要
+└── sessions/
+    └── 2026-09-12_2110.jsonl   # L2 会话日志，一行一条消息
+```
+
+- **L1 工作上下文**：每次请求组装 `人设 → 长期记忆 → 摘要 → 最近 N 轮`，N 由 `max_context_messages` 决定。
+- **L2 会话日志**：逐条追加写 jsonl，崩溃不丢；被打断的回复带 `"interrupted": true`。
+- **L3 长期记忆**：`MemoryStore.remember()` 写入 `profile.json`；`recall()` 目前是关键词匹配，接口预留将来替换成向量检索。
+- `memory/` 已在 `.gitignore` 中忽略，不会进仓库。
 
 ### 角色管理
 
@@ -183,6 +235,9 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 | 拖动角色 | 移动位置，按拖拽方向镜像，松开回到基础状态 |
 | 右键角色 | 固定/自由模式 · 表情 · 对话窗 · 番茄钟 · 设置 |
 | 托盘右键 | 打开设置 / 退出 |
+| 对话窗输入框 | `Enter` 发送，`Shift+Enter` 换行 |
+| 对话窗「停止」 | 随时打断生成，已生成内容保留 |
+| 角色设置「测试连接」 | 发一条极短请求，把鉴权 / 地址 / 模型名的报错直接显示出来 |
 
 ## 开发约定
 

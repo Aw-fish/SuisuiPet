@@ -5,5 +5,10 @@ __pycache__/
 # User-specific runtime configuration
 data/settings.json
 
-# 角色记忆（对话历史属于私人数据，不进仓库）
+# 角色数据：只跟踪示例角色 default 的立绘，其余角色一律不进仓库
+data/characters/*
+!data/characters/default/
+# 记忆属于私人对话数据，示例角色也不跟踪
 data/characters/*/memory/
+# 角色配置里有 API Key，同样不跟踪（gitignore 只能忽略整个文件，不能只忽略某个字段）
+data/characters/*/character.json

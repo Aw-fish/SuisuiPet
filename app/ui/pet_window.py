@@ -3,11 +3,13 @@ from __future__ import annotations
 import random
 from pathlib import Path
 from typing import Callable
-from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt
+from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QRect, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPixmap
-from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 from app import characters
 from app.config import load_settings, save_settings
+from app.conversation.message import ROLE_ASSISTANT, ROLE_USER
+from app.conversation.service import ConversationService
 from app.pet.animator import SpriteAnimator
 from app.pet.character_sprite import CharacterAssets
 from app.ui.dialogs import StyledDialog
@@ -19,6 +21,10 @@ SPRITE_HEIGHT = 224
 BUBBLE_HEIGHT = 34
 #: 找不到立绘时的窗口尺寸（窗口会被隐藏，仅用于几何计算）
 DEFAULT_CANVAS_SIZE = QSize(168, 168)
+#: 打开对话窗时最多恢复多少条历史
+HISTORY_LIMIT = 30
+#: 单个气泡的最大宽度
+MAX_BUBBLE_WIDTH = 300
 
 ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
 
@@ -82,37 +88,194 @@ def motion_profile(level: int) -> tuple[int, float, int]:
     return interval, chance, distance
 
 
+class ChatInput(QTextEdit):
+    """Enter 发送、Shift+Enter 换行。"""
+
+    submitted = Signal()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+            self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class ChatDialog(QDialog):
-    def __init__(self, parent: QWidget) -> None:
+    """流式对话窗：中途可停止、支持历史恢复，生成时联动桌宠的说话动作。"""
+
+    def __init__(self, parent: QWidget, conversation: ConversationService) -> None:
         super().__init__(parent)
+        self.conversation = conversation
         self.drag: QPoint | None = None
-        self.setFixedSize(360, 430)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self._stream_label: QLabel | None = None
+        self._buffer = ""
+        self._follow = True
+        self._reset_timer = QTimer(self)
+        self._reset_timer.setInterval(40)
+        self._reset_timer.timeout.connect(self._flush_stream)
+
+        self.setFixedSize(390, 480)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         root = QFrame(objectName="chatRoot")
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(root)
-        layout = QVBoxLayout(root); layout.setContentsMargins(16, 10, 16, 16); layout.setSpacing(10)
+        layout = QVBoxLayout(root); layout.setContentsMargins(16, 10, 16, 16); layout.setSpacing(8)
         self.drag_bar = QFrame(objectName="dragBar"); self.drag_bar.setFixedHeight(28); self.drag_bar.setCursor(Qt.OpenHandCursor); self.drag_bar.installEventFilter(self)
-        bar = QHBoxLayout(self.drag_bar); bar.setContentsMargins(0, 0, 0, 0); bar.addStretch()
+        bar = QHBoxLayout(self.drag_bar); bar.setContentsMargins(0, 0, 0, 0)
+        self.title = QLabel("对话", objectName="chatTitle"); bar.addWidget(self.title); bar.addStretch()
         close = QPushButton("×", objectName="chatClose"); close.clicked.connect(self.hide); bar.addWidget(close); layout.addWidget(self.drag_bar)
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame); self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         self.messages = QWidget(); self.history = QVBoxLayout(self.messages); self.history.setContentsMargins(2, 2, 2, 2); self.history.addStretch(); self.scroll.setWidget(self.messages); layout.addWidget(self.scroll, 1)
-        row = QHBoxLayout(); self.input = QLineEdit(placeholderText="说点什么……"); send = QPushButton("发送", objectName="send"); send.clicked.connect(self.send); row.addWidget(self.input, 1); row.addWidget(send); layout.addLayout(row)
-        self.setStyleSheet('QDialog { background: transparent; } QFrame#chatRoot { background: #FFFFFF; border:1px solid #EAE6F2; border-radius:16px; } QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; } QLineEdit { border:1px solid #E8E5F0; background:rgba(255,255,255,220); border-radius:10px; padding:9px; } QPushButton#send { background:#917DE8; color:white; border:0; border-radius:10px; padding:9px 15px; } QPushButton#chatClose { border:0; background:transparent; color:#A39CAD; font-size:17px; min-width:24px; max-width:24px; } QPushButton#chatClose:hover { color:#685D78; background:#F4F1FA; border-radius:8px; } QLabel#petMsg { background:#F7F5FB; color:#4C4759; border-radius:12px; padding:9px 12px; } QLabel#userMsg { background:#EEEAFE; color:#51457B; border-radius:12px; padding:9px 12px; }')
+        self.status = QLabel("", objectName="chatStatus"); layout.addWidget(self.status)
+        row = QHBoxLayout(); row.setSpacing(8)
+        self.input = ChatInput(objectName="chatInput"); self.input.setPlaceholderText("说点什么……（Enter 发送，Shift+Enter 换行）"); self.input.setFixedHeight(40)
+        self.input.submitted.connect(self._on_button)
+        self.send_button = QPushButton("发送", objectName="send"); self.send_button.clicked.connect(self._on_button)
+        row.addWidget(self.input, 1); row.addWidget(self.send_button); layout.addLayout(row)
+        self.setStyleSheet(CHAT_QSS)
+        conversation.delta.connect(self._on_delta)
+        conversation.finished.connect(self._on_finished)
+        conversation.failed.connect(self._on_failed)
+        conversation.busy_changed.connect(self._on_busy_changed)
 
+    # ---- 消息渲染 -----------------------------------------------------------
 
-    def add(self, text: str, user: bool) -> None:
+    @staticmethod
+    def _fit_width(label: QLabel, text: str) -> int:
+        metrics = QFontMetrics(label.font())
+        rect = metrics.boundingRect(QRect(0, 0, MAX_BUBBLE_WIDTH, 0), Qt.TextWordWrap, text or " ")
+        return max(72, min(MAX_BUBBLE_WIDTH, rect.width() + 26))
+
+    def add(self, text: str, user: bool) -> QLabel:
         label = QLabel(text, objectName="userMsg" if user else "petMsg")
         label.setWordWrap(True)
-        content_width = QFontMetrics(label.font()).horizontalAdvance(text) + 25
-        label.setFixedWidth(min(306, max(72, content_width)))
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setFixedWidth(self._fit_width(label, text))
         row = QHBoxLayout()
         if user: row.addStretch(); row.addWidget(label)
         else: row.addWidget(label); row.addStretch()
         self.history.insertLayout(self.history.count() - 1, row)
-        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
+        self._scroll_to_bottom()
+        return label
+
+    def clear(self) -> None:
+        self._stream_label = None
+        while self.history.count() > 1:
+            item = self.history.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            child = item.layout()
+            if child is not None:
+                self._clear_layout(child)
+
+    def _clear_layout(self, layout) -> None:  # type: ignore[no-untyped-def]
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            child = item.layout()
+            if child is not None:
+                self._clear_layout(child)
+
+    def load_history(self, messages) -> None:  # type: ignore[no-untyped-def]
+        """把最近的会话渲染出来，重启后仍能看到上下文。"""
+        self.clear()
+        for message in messages:
+            if message.role == ROLE_USER:
+                self.add(message.content, True)
+            elif message.role == ROLE_ASSISTANT and message.content:
+                self.add(message.content + ("（已打断）" if message.interrupted else ""), False)
+        self._follow = True
+        self._scroll_to_bottom()
+
+    # ---- 滚动跟随 -----------------------------------------------------------
+
+    def _on_scrolled(self, value: int) -> None:
+        bar = self.scroll.verticalScrollBar()
+        self._follow = value >= bar.maximum() - 8
+
+    def _scroll_to_bottom(self) -> None:
+        if not self._follow:
+            return
+        bar = self.scroll.verticalScrollBar()
+        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+    # ---- 发送 / 打断 --------------------------------------------------------
+
+    def _on_button(self) -> None:
+        if self.conversation.busy:
+            self.status.setText("正在停止…")
+            self.conversation.interrupt()
+            return
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        self.input.clear()
+        self.add(text, True)
+        self.status.setText("正在思考…")
+        self.conversation.send(text)
+
+    def _on_busy_changed(self, busy: bool) -> None:
+        self.send_button.setText("停止" if busy else "发送")
+        self.send_button.setObjectName("stop" if busy else "send")
+        self.send_button.style().unpolish(self.send_button)
+        self.send_button.style().polish(self.send_button)
+        if busy:
+            self._buffer = ""
+            self._stream_label = self.add("", False)
+            self.status.setText("生成中…")
+            self._reset_timer.start()
+        else:
+            self._reset_timer.stop()
+            self._end_stream_bubble()
+
+    def _end_stream_bubble(self) -> None:
+        label = self._stream_label
+        self._stream_label = None
+        if label is not None and not label.text():
+            label.setText("（没有内容）")
+
+    def _on_delta(self, text: str) -> None:
+        self._buffer += text
+
+    def _flush_stream(self) -> None:
+        label = self._stream_label
+        if label is None:
+            return
+        text = self._buffer.strip()
+        if label.text() == text:
+            return
+        label.setText(text)
+        label.setFixedWidth(self._fit_width(label, text))
+        self._scroll_to_bottom()
+
+    def _on_finished(self, text: str) -> None:
+        self._reset_timer.stop()
+        if self._stream_label is not None:
+            self._buffer = text
+            self._flush_stream()
+            self._stream_label = None
+        self.status.setText("")
+
+    def _on_failed(self, message: str) -> None:
+        self._reset_timer.stop()
+        label = self._stream_label
+        self._stream_label = None
+        text = f"出错：{message}"
+        if label is not None and not label.text():
+            label.setText(text)
+            label.setFixedWidth(self._fit_width(label, text))
+        else:
+            self.add(text, False)
+        self.status.setText("")
+
+    # ---- 窗口 ---------------------------------------------------------------
 
     def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
         if watched is self.drag_bar:
@@ -124,13 +287,33 @@ class ChatDialog(QDialog):
                 self.drag = None; self.drag_bar.setCursor(Qt.OpenHandCursor); return True
         return super().eventFilter(watched, event)
 
-    def send(self) -> None:
-        text = self.input.text().strip()
-        if text: self.add(text, True); self.add("已收到信息，此时显示测试文本123123。", False); self.input.clear()
-
     def show_near(self, pet: QWidget) -> None:
-        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 30, 180)
+        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 30, 190)
         self.move(max(area.left() + 8, point.x()), max(area.top() + 8, point.y())); self.show(); self.raise_(); self.activateWindow()
+
+
+CHAT_QSS = (
+    'QDialog { background: transparent; }'
+    'QFrame#chatRoot { background:#FFFFFF; border:1px solid #EAE6F2; border-radius:16px; }'
+    'QLabel#chatTitle { color:#5C5275; font:600 11px "Microsoft YaHei UI"; }'
+    'QLabel#chatStatus { color:#A39CAD; font:10px "Microsoft YaHei UI"; padding-left:2px; }'
+    'QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }'
+    'QScrollBar:vertical { background:transparent; width:8px; margin:0; }'
+    'QScrollBar::handle:vertical { background:#DFDAEC; border-radius:4px; min-height:28px; }'
+    'QScrollBar::handle:vertical:hover { background:#CFC8E0; }'
+    'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }'
+    'QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical { background:transparent; }'
+    'QTextEdit#chatInput { border:1px solid #E8E5F0; background:rgba(255,255,255,220); border-radius:10px; padding:8px 10px; color:#403C4B; }'
+    'QTextEdit#chatInput:focus { border-color:#B8AAF3; }'
+    'QPushButton#send { background:#917DE8; color:white; border:0; border-radius:10px; padding:9px 15px; }'
+    'QPushButton#send:hover { background:#806CD9; }'
+    'QPushButton#stop { background:#F2EFF9; color:#73688F; border:0; border-radius:10px; padding:9px 15px; }'
+    'QPushButton#stop:hover { background:#E8E2F5; }'
+    'QPushButton#chatClose { border:0; background:transparent; color:#A39CAD; font-size:17px; min-width:24px; max-width:24px; }'
+    'QPushButton#chatClose:hover { color:#685D78; background:#F4F1FA; border-radius:8px; }'
+    'QLabel#petMsg { background:#F7F5FB; color:#4C4759; border-radius:12px; padding:9px 12px; }'
+    'QLabel#userMsg { background:#EEEAFE; color:#51457B; border-radius:12px; padding:9px 12px; }'
+)
 
 
 class TimerWindow(QWidget):
@@ -202,7 +385,8 @@ class PetWindow(QWidget):
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
         self.animation = QPropertyAnimation(self, b'pos', self); self.animation.setDuration(650); self.animation.finished.connect(self._on_wander_finished)
-        self.chat = ChatDialog(self); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self.load_character(load_settings()); self._place()
+        self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy)
+        self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self.load_character(load_settings()); self._place()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
     def _sync_geometry(self) -> None:
@@ -225,6 +409,12 @@ class PetWindow(QWidget):
         self.wander.setInterval(motion_profile(self.activity)[0])
         if not self.wander.isActive(): self.wander.start()
         self.canvas.set_assets(assets); self._sync_geometry()
+        name, info = current_character(data)
+        self.conversation.configure(name, info)
+        self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
+    def _on_conversation_busy(self, busy: bool) -> None:
+        if busy: self.canvas.set_state('Talk')
+        else: self._restore_state()
     def show_pet(self) -> None:
         """入口调用：有立绘就显示窗口，没有则隐藏并提示一次。"""
         if self.assets is not None:

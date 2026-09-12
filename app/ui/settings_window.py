@@ -3,20 +3,38 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
-    QPushButton, QRadioButton, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon, QTextEdit,
-    QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
+    QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QPushButton, QRadioButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
+    QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
 )
 from app import characters
 from app.config import load_settings, save_settings
+from app.conversation.service import check_connection
 from app.ui.dialogs import StyledDialog
 from app.ui.icons import app_icon
 from app.ui.menus import styled_menu
+
+
+class _ConnectWorker(QThread):
+    """在后台跑「测试连接」，避免界面卡住。"""
+
+    done = Signal(bool, str)
+
+    def __init__(self, info: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._info = dict(info)
+
+    def run(self) -> None:
+        try:
+            ok, message = check_connection(self._info)
+        except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
+            ok, message = False, f"测试失败：{exc}"
+        self.done.emit(ok, message)
 
 
 class ComboBox(QComboBox):
@@ -54,6 +72,7 @@ class SettingsWindow(QMainWindow):
         self.drag_position: QPoint | None = None
         self._active_character: str | None = None
         self._character_cache: dict[str, dict] = {}
+        self._test_worker: _ConnectWorker | None = None
         self.setWindowTitle("SuisuiPet")
         self.setFixedSize(900, 740)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.NoDropShadowWindowHint)
@@ -113,14 +132,24 @@ class SettingsWindow(QMainWindow):
         self.setStyleSheet(self._qss())
 
     def _page(self, title: str, description: str) -> tuple[QWidget, QVBoxLayout]:
+        """标题固定在顶部，字段区域可滚动，避免以后加设置项时被挤扁。"""
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 14, 0, 0)
-        layout.addWidget(QLabel(title, objectName="title"))
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 14, 0, 0)
+        outer.addWidget(QLabel(title, objectName="title"))
         text = QLabel(description, objectName="description")
         text.setWordWrap(True)
-        layout.addWidget(text)
-        layout.addSpacing(20)
+        outer.addWidget(text)
+        outer.addSpacing(16)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 10, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
         return page, layout
 
     @staticmethod
@@ -173,16 +202,6 @@ class SettingsWindow(QMainWindow):
         asset_row.addWidget(self.asset_path, 1)
         asset_row.addWidget(self.browse_button)
         layout.addLayout(asset_row)
-        layout.addWidget(self._label("AI 模型名称"))
-        self.model = QLineEdit()
-        self.model.setPlaceholderText("例如：gpt-5")
-        layout.addWidget(self.model)
-        layout.addWidget(self._label("API Key"))
-        self.key = QLineEdit(); self.key.setEchoMode(QLineEdit.Password); self.key.setPlaceholderText("仅保存在本机")
-        layout.addWidget(self.key)
-        layout.addWidget(self._label("角色提示词"))
-        self.prompt = QTextEdit(); self.prompt.setFixedHeight(64); self.prompt.setPlaceholderText("描述角色的性格、语气与对话边界……")
-        layout.addWidget(self.prompt)
         layout.addWidget(self._label("移动频率"))
         activity_row = QHBoxLayout()
         activity_row.setSpacing(10)
@@ -199,6 +218,49 @@ class SettingsWindow(QMainWindow):
         activity_row.addWidget(self.activity_value)
         layout.addLayout(activity_row)
         layout.addWidget(QLabel("数值越大，角色随机移动越频繁、距离越远。", objectName="hint"))
+        layout.addWidget(self._label("AI 模型名称"))
+        self.model = QLineEdit()
+        self.model.setPlaceholderText("例如：deepseek-chat")
+        layout.addWidget(self.model)
+        layout.addWidget(self._label("API 地址"))
+        self.base_url = QLineEdit()
+        self.base_url.setPlaceholderText("例如：https://api.deepseek.com/v1")
+        layout.addWidget(self.base_url)
+        layout.addWidget(self._label("API Key"))
+        self.key = QLineEdit()
+        self.key.setEchoMode(QLineEdit.Password)
+        self.key.setPlaceholderText("仅保存在本机，character.json 不会被上传")
+        layout.addWidget(self.key)
+        params = QHBoxLayout()
+        params.setSpacing(12)
+        temperature_box = QVBoxLayout()
+        temperature_box.addWidget(self._label("温度"))
+        self.temperature = QDoubleSpinBox()
+        self.temperature.setRange(0.0, 2.0)
+        self.temperature.setSingleStep(0.1)
+        self.temperature.setDecimals(1)
+        temperature_box.addWidget(self.temperature)
+        limit_box = QVBoxLayout()
+        limit_box.addWidget(self._label("上下文轮数"))
+        self.context_limit = QSpinBox()
+        self.context_limit.setRange(2, 50)
+        self.context_limit.setSuffix(" 轮")
+        limit_box.addWidget(self.context_limit)
+        params.addLayout(temperature_box, 1)
+        params.addLayout(limit_box, 1)
+        layout.addLayout(params)
+        layout.addWidget(self._label("角色提示词"))
+        self.prompt = QTextEdit(); self.prompt.setFixedHeight(88); self.prompt.setPlaceholderText("描述角色的性格、语气与对话边界……")
+        layout.addWidget(self.prompt)
+        test_row = QHBoxLayout()
+        test_row.setSpacing(10)
+        self.test_button = QPushButton("测试连接", objectName="mini")
+        self.test_button.clicked.connect(self._test_connection)
+        self.test_result = QLabel("", objectName="hint")
+        self.test_result.setWordWrap(True)
+        test_row.addWidget(self.test_button)
+        test_row.addWidget(self.test_result, 1)
+        layout.addLayout(test_row)
         layout.addStretch()
         return page
 
@@ -262,7 +324,18 @@ class SettingsWindow(QMainWindow):
         self.live2d_format.setChecked(not is_img)
         self._show_asset_target(name, info)
         self.model.setText(str(info.get("model", "")))
+        self.base_url.setText(str(info.get("base_url", "")))
         self.key.setText(str(info.get("api_key", "")))
+        try:
+            temperature = float(info.get("temperature", 0.8))
+        except (TypeError, ValueError):
+            temperature = 0.8
+        self.temperature.setValue(max(0.0, min(2.0, temperature)))
+        try:
+            limit = int(info.get("max_context_messages", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        self.context_limit.setValue(max(2, min(50, limit)))
         self.prompt.setPlainText(str(info.get("system_prompt", "")))
         try:
             activity = int(info.get("activity", 5))
@@ -270,6 +343,8 @@ class SettingsWindow(QMainWindow):
             activity = 5
         self.activity.setValue(max(1, min(10, activity)))
         self._on_activity_changed(self.activity.value())
+        self.test_result.setText("")
+        self.test_result.setStyleSheet("")
 
     def _show_asset_target(self, name: str, info: dict) -> None:
         """img 格式固定指向角色目录下的 sprites，live2d 指向所选模型文件。"""
@@ -292,10 +367,46 @@ class SettingsWindow(QMainWindow):
             "asset": characters.SPRITE_DIRNAME,
             "asset_path": "" if is_img else self.asset_path.text().strip(),
             "model": self.model.text().strip(),
+            "base_url": self.base_url.text().strip(),
             "api_key": self.key.text().strip(),
+            "temperature": round(self.temperature.value(), 1),
+            "max_context_messages": self.context_limit.value(),
             "system_prompt": self.prompt.toPlainText().strip(),
             "activity": self.activity.value(),
         })
+
+    # ---- 对话配置与连接测试 ------------------------------------------------
+
+    def _conversation_info(self) -> dict:
+        """用界面上当前的值组一份配置，供测试连接使用（不必先保存）。"""
+        info = dict(self._character_info(self._active_character)) if self._active_character else {}
+        info.update({
+            "model": self.model.text().strip(),
+            "base_url": self.base_url.text().strip(),
+            "api_key": self.key.text().strip(),
+            "temperature": round(self.temperature.value(), 1),
+            "max_context_messages": self.context_limit.value(),
+            "system_prompt": self.prompt.toPlainText().strip(),
+        })
+        return info
+
+    def _test_connection(self) -> None:
+        if self._test_worker is not None:
+            return
+        self.test_button.setEnabled(False)
+        self.test_result.setStyleSheet("")
+        self.test_result.setText("测试中…")
+        worker = _ConnectWorker(self._conversation_info(), self)
+        worker.done.connect(self._on_test_done)
+        worker.finished.connect(worker.deleteLater)
+        self._test_worker = worker
+        worker.start()
+
+    def _on_test_done(self, ok: bool, message: str) -> None:
+        self._test_worker = None
+        self.test_button.setEnabled(True)
+        self.test_result.setStyleSheet(f"color:{'#3FA46A' if ok else '#D0605F'};")
+        self.test_result.setText(message)
 
     def _flush_characters(self) -> None:
         for name in self._registered():
@@ -466,7 +577,7 @@ class SettingsWindow(QMainWindow):
 
     @classmethod
     def _qss(cls) -> str:
-        return f'''QWidget#root {{ background:white; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:6px; }} QLineEdit,QComboBox,QSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }} QPushButton#mini {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:9px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:9px 12px; }} QPushButton#mini:hover {{ background:#EBE6FA; }} QPushButton#mini:pressed {{ background:#E2DAF8; }} QLineEdit:read-only {{ background:#FAFAFD; color:#7A7488; border-color:#EFEDF5; }} QLabel#chip {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:8px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:5px 0; }} QSlider::groove:horizontal {{ height:6px; background:#EFEDF7; border-radius:3px; }} QSlider::sub-page:horizontal {{ background:{cls.ACCENT}; border-radius:3px; }} QSlider::add-page:horizontal {{ background:#EFEDF7; border-radius:3px; }} QSlider::handle:horizontal {{ width:12px; height:12px; margin:-5px 0; background:white; border:2px solid {cls.ACCENT}; border-radius:8px; }} QSlider::handle:horizontal:hover {{ border-color:#806CD9; }} QComboBox QAbstractItemView {{ background:transparent; border:0; border-radius:10px; padding:4px; outline:0; color:#403C4B; selection-background-color:#F0EDFB; selection-color:#6D5DC0; }} QComboBox QAbstractItemView::item {{ min-height:22px; padding:4px 8px; }}'''
+        return f'''QWidget#root {{ background:white; border:1px solid #ECEAF2; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:6px; }} QLineEdit,QComboBox,QSpinBox,QDoubleSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button,QDoubleSpinBox::up-button,QDoubleSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button,QDoubleSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button,QDoubleSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QDoubleSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }} QPushButton#mini {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:9px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:9px 12px; }} QPushButton#mini:hover {{ background:#EBE6FA; }} QPushButton#mini:pressed {{ background:#E2DAF8; }} QLineEdit:read-only {{ background:#FAFAFD; color:#7A7488; border-color:#EFEDF5; }} QLabel#chip {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:8px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:5px 0; }} QSlider::groove:horizontal {{ height:6px; background:#EFEDF7; border-radius:3px; }} QSlider::sub-page:horizontal {{ background:{cls.ACCENT}; border-radius:3px; }} QSlider::add-page:horizontal {{ background:#EFEDF7; border-radius:3px; }} QSlider::handle:horizontal {{ width:12px; height:12px; margin:-5px 0; background:white; border:2px solid {cls.ACCENT}; border-radius:8px; }} QSlider::handle:horizontal:hover {{ border-color:#806CD9; }} QComboBox QAbstractItemView {{ background:transparent; border:0; border-radius:10px; padding:4px; outline:0; color:#403C4B; selection-background-color:#F0EDFB; selection-color:#6D5DC0; }} QComboBox QAbstractItemView::item {{ min-height:22px; padding:4px 8px; }} QScrollArea {{ background:transparent; border:0; }} QScrollArea > QWidget > QWidget {{ background:transparent; }} QScrollBar:vertical {{ background:transparent; width:8px; margin:0; }} QScrollBar::handle:vertical {{ background:#DFDAEC; border-radius:4px; min-height:30px; }} QScrollBar::handle:vertical:hover {{ background:#CFC8E0; }} QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {{ height:0; }} QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical {{ background:transparent; }}'''
 
 
 

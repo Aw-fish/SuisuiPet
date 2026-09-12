@@ -27,13 +27,18 @@ CONFIG_NAME = "character.json"
 SPRITE_DIRNAME = "sprites"
 MEMORY_DIRNAME = "memory"
 
+#: API Key 存在这里，方便本地改动；character.json 已在 .gitignore 中忽略，
+#: 不会随仓库上传
 DEFAULT_CHARACTER: dict[str, Any] = {
     "name": "",
     "format": "img",
     "asset": SPRITE_DIRNAME,
     "asset_path": "",
-    "model": "",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
     "api_key": "",
+    "temperature": 0.8,
+    "max_context_messages": 20,
     "system_prompt": "",
     "activity": 5,
 }

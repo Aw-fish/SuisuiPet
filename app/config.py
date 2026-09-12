@@ -61,7 +61,6 @@ def _migrate_character_entry(name: str, info: dict[str, Any]) -> str:
             "asset": characters.SPRITE_DIRNAME,
             "asset_path": "",
             "model": info.get("model", ""),
-            "api_key": info.get("api_key", ""),
             "system_prompt": info.get("system_prompt", ""),
             "activity": info.get("activity", 5),
         },
