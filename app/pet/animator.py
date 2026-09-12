@@ -28,6 +28,7 @@ class SpriteAnimator(QObject):
         self._index = 0
         self._override: str | None = None
         self._override_mirrored = False
+        self._pinned: str | None = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
         self._expire = QTimer(self)
@@ -37,10 +38,34 @@ class SpriteAnimator(QObject):
     def set_assets(self, assets: CharacterAssets | None) -> None:
         self._assets = assets
         self._override = None
+        self._pinned = None
         self._index = 0
         self._expire.stop()
         self._sync_timer()
         self.frame_changed.emit()
+
+    def pin(self, state: str) -> None:
+        """固定显示某个素材（通常是整张立绘的表情），优先级高于一切。"""
+        if self._assets is None or not self._assets.has(state):
+            return
+        self._pinned = state
+        self._override = None
+        self._expire.stop()
+        self._index = 0
+        self._sync_timer()
+        self.frame_changed.emit()
+
+    def unpin(self) -> None:
+        if self._pinned is None:
+            return
+        self._pinned = None
+        self._index = 0
+        self._sync_timer()
+        self.frame_changed.emit()
+
+    @property
+    def pinned(self) -> str | None:
+        return self._pinned
 
     def set_state(self, state: str, mirrored: bool = False, restart: bool = False) -> None:
         if self._assets is None:
@@ -54,7 +79,7 @@ class SpriteAnimator(QObject):
         self.frame_changed.emit()
 
     def show_temporary(self, state: str, duration_ms: int, mirrored: bool = False) -> None:
-        if self._assets is None or not self._assets.has(state):
+        if self._assets is None or self._pinned is not None or not self._assets.has(state):
             return
         self._override = state
         self._override_mirrored = mirrored
@@ -73,7 +98,7 @@ class SpriteAnimator(QObject):
 
     @property
     def state(self) -> str:
-        return self._override or self._state
+        return self._pinned or self._override or self._state
 
     def current(self) -> QPixmap | None:
         frames = self._frames()
@@ -84,6 +109,8 @@ class SpriteAnimator(QObject):
     def _frames(self) -> list[QPixmap]:
         if self._assets is None:
             return []
+        if self._pinned is not None:
+            return self._assets.frames(self._pinned)
         if self._override is not None:
             return self._assets.frames(self._override, self._override_mirrored)
         return self._assets.frames(self._state, self._mirrored)

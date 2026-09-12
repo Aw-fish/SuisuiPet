@@ -16,6 +16,7 @@ DEFAULT_CHARACTER: dict[str, Any] = {
     "model": "",
     "api_key": "",
     "system_prompt": "",
+    "activity": 5,
 }
 
 DEFAULT_SETTINGS: dict[str, Any] = {

@@ -7,12 +7,13 @@ from copy import deepcopy
 
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QRadioButton, QSpinBox, QStackedWidget, QSystemTrayIcon, QTextEdit,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QPushButton, QRadioButton, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon, QTextEdit,
     QVBoxLayout, QWidget,
 )
 from app.config import DEFAULT_CHARACTER, load_settings, save_settings
 from app.pet.character_sprite import default_art_usable
+from app.ui.dialogs import StyledDialog
 
 
 class SettingsWindow(QMainWindow):
@@ -26,7 +27,7 @@ class SettingsWindow(QMainWindow):
         self.drag_position: QPoint | None = None
         self._active_character: str | None = None
         self.setWindowTitle("SuisuiPet")
-        self.setFixedSize(900, 660)
+        self.setFixedSize(900, 740)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self._build()
         self._build_tray()
@@ -147,8 +148,27 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self._label("角色提示词"))
         self.prompt = QTextEdit(); self.prompt.setFixedHeight(64); self.prompt.setPlaceholderText("描述角色的性格、语气与对话边界……")
         layout.addWidget(self.prompt)
+        layout.addWidget(self._label("移动频率"))
+        activity_row = QHBoxLayout()
+        activity_row.setSpacing(10)
+        self.activity = QSlider(Qt.Horizontal)
+        self.activity.setRange(1, 10)
+        self.activity.setSingleStep(1)
+        self.activity.setPageStep(1)
+        self.activity.setFixedHeight(24)
+        self.activity.valueChanged.connect(self._on_activity_changed)
+        self.activity_value = QLabel(objectName="chip")
+        self.activity_value.setAlignment(Qt.AlignCenter)
+        self.activity_value.setFixedWidth(52)
+        activity_row.addWidget(self.activity, 1)
+        activity_row.addWidget(self.activity_value)
+        layout.addLayout(activity_row)
+        layout.addWidget(QLabel("数值越大，角色随机移动越频繁、距离越远。", objectName="hint"))
         layout.addStretch()
         return page
+
+    def _on_activity_changed(self, value: int) -> None:
+        self.activity_value.setText(f"{value} / 10")
 
     def _mode_page(self) -> QWidget:
         page, layout = self._page("模式设置", "分别控制角色在桌面上的行为和对话入口。")
@@ -206,6 +226,12 @@ class SettingsWindow(QMainWindow):
         self.model.setText(str(info.get("model", "")))
         self.key.setText(str(info.get("api_key", "")))
         self.prompt.setPlainText(str(info.get("system_prompt", "")))
+        try:
+            activity = int(info.get("activity", 5))
+        except (TypeError, ValueError):
+            activity = 5
+        self.activity.setValue(max(1, min(10, activity)))
+        self._on_activity_changed(self.activity.value())
 
     def _store_character_fields(self, name: str) -> None:
         info = self._characters().get(name)
@@ -217,6 +243,7 @@ class SettingsWindow(QMainWindow):
             "model": self.model.text().strip(),
             "api_key": self.key.text().strip(),
             "system_prompt": self.prompt.toPlainText().strip(),
+            "activity": self.activity.value(),
         })
 
     def _on_format_changed(self) -> None:
@@ -235,13 +262,15 @@ class SettingsWindow(QMainWindow):
         self._load_character_fields(name)
 
     def _add_character(self) -> None:
-        name, accepted = QInputDialog.getText(self, "添加角色", "角色名称：")
-        name = name.strip()
-        if not accepted or not name:
+        name = StyledDialog.ask_text(self, "添加角色", "为新角色起一个名字，之后可以单独配置它的立绘与对话服务。", placeholder="例如：Suisui")
+        if name is None:
+            return
+        if not name:
+            StyledDialog.notice(self, "添加角色", "角色名称不能为空。")
             return
         items = self._characters()
         if name in items:
-            QMessageBox.information(self, "添加角色", f"角色“{name}”已存在。")
+            StyledDialog.notice(self, "添加角色", f"角色“{name}”已存在。")
             return
         if self._active_character in items:
             self._store_character_fields(self._active_character)
@@ -255,9 +284,9 @@ class SettingsWindow(QMainWindow):
         if name not in items:
             return
         if len(items) <= 1:
-            QMessageBox.information(self, "删除角色", "至少需要保留一个角色。")
+            StyledDialog.notice(self, "删除角色", "至少需要保留一个角色。")
             return
-        if QMessageBox.question(self, "删除角色", f"确定删除角色“{name}”吗？") != QMessageBox.StandardButton.Yes:
+        if not StyledDialog.confirm(self, "删除角色", f"确定要删除角色“{name}”吗？该角色的立绘与对话配置会一并移除。"):
             return
         items.pop(name)
         self.data["character"]["selected"] = next(iter(items))
@@ -274,7 +303,7 @@ class SettingsWindow(QMainWindow):
         if path:
             self.asset_path.setText(path)
             if self.img_format.isChecked() and not default_art_usable(path):
-                QMessageBox.information(self, "提示", "该文件夹内未找到透明背景的 Default 立绘，桌宠会回退到其他可用形象。")
+                StyledDialog.notice(self, "立绘不可用", "该文件夹内未找到透明背景的 Default 立绘，桌宠会回退到其他可用形象。")
 
     def _load(self) -> None:
         c, a, t = self.data["character"], self.data["conversation"], self.data["tools"]
@@ -335,7 +364,7 @@ class SettingsWindow(QMainWindow):
 
     @classmethod
     def _qss(cls) -> str:
-        return f'''QWidget#root {{ background:white; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:6px; }} QLineEdit,QComboBox,QSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }} QPushButton#mini {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:9px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:9px 12px; }} QPushButton#mini:hover {{ background:#EBE6FA; }} QPushButton#mini:pressed {{ background:#E2DAF8; }} QLineEdit:read-only {{ background:#FAFAFD; color:#7A7488; border-color:#EFEDF5; }}'''
+        return f'''QWidget#root {{ background:white; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:6px; }} QLineEdit,QComboBox,QSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }} QPushButton#mini {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:9px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:9px 12px; }} QPushButton#mini:hover {{ background:#EBE6FA; }} QPushButton#mini:pressed {{ background:#E2DAF8; }} QLineEdit:read-only {{ background:#FAFAFD; color:#7A7488; border-color:#EFEDF5; }} QLabel#chip {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:8px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:5px 0; }} QSlider::groove:horizontal {{ height:6px; background:#EFEDF7; border-radius:3px; }} QSlider::sub-page:horizontal {{ background:{cls.ACCENT}; border-radius:3px; }} QSlider::add-page:horizontal {{ background:#EFEDF7; border-radius:3px; }} QSlider::handle:horizontal {{ width:12px; height:12px; margin:-5px 0; background:white; border:2px solid {cls.ACCENT}; border-radius:8px; }} QSlider::handle:horizontal:hover {{ border-color:#806CD9; }}'''
 
 
 

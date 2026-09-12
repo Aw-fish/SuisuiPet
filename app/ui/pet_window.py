@@ -17,6 +17,36 @@ BUBBLE_HEIGHT = 34
 #: 没有立绘素材时使用的手绘占位尺寸
 PLACEHOLDER_SIZE = QSize(168, 168)
 
+#: 右键菜单样式，子菜单复用同一份
+MENU_QSS = 'QMenu { background:white; border:1px solid #E9E5F1; border-radius:10px; padding:6px; } QMenu::item { padding:8px 34px 8px 12px; border-radius:7px; } QMenu::item:selected { background:#F0EDFB; color:#6D5DC0; } QMenu::item:disabled { color:#BEB9C9; } QMenu::separator { height:1px; background:#F0EDF5; margin:5px 8px; }'
+
+
+def styled_menu(parent: QWidget | None = None) -> QMenu:
+    """圆角菜单：关闭系统方形投影并开启透明，避免阴影露出直角。"""
+    menu = QMenu(parent)
+    menu.setStyleSheet(MENU_QSS)
+    menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+    menu.setAttribute(Qt.WA_TranslucentBackground)
+    return menu
+
+ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
+
+#: 立绘素材本身的朝向：True 表示默认朝向屏幕左侧。
+#: 随机移动按这张表决定镜像；拖拽沿用"向左即镜像"的写法。
+ART_FACES_LEFT = True
+
+
+def wander_mirrored(delta_x: int) -> bool:
+    """随机移动时的镜像规则：素材朝左时，向右移动才需要镜像。"""
+    if delta_x == 0:
+        return False
+    return (delta_x > 0) == ART_FACES_LEFT
+
+
+def drag_mirrored(delta_x: int) -> bool:
+    """拖拽时的镜像规则：向左拖即镜像。"""
+    return delta_x < 0
+
 
 def character_folders(data: dict) -> list[Path]:
     """当前角色的候选立绘文件夹：先用配置路径，再自动探测 data/img1、data/img。"""
@@ -32,6 +62,25 @@ def character_folders(data: dict) -> list[Path]:
         if candidate.is_dir() and candidate not in folders:
             folders.append(candidate)
     return folders
+
+
+def character_activity(data: dict) -> int:
+    """读取当前角色的活跃度（1-10），越界或非法值回落到默认。"""
+    character = data.get("character", {})
+    info = character.get("items", {}).get(character.get("selected"), {})
+    try:
+        return max(ACTIVITY_MIN, min(ACTIVITY_MAX, int(info.get("activity", ACTIVITY_DEFAULT))))
+    except (TypeError, ValueError):
+        return ACTIVITY_DEFAULT
+
+
+def motion_profile(level: int) -> tuple[int, float, int]:
+    """把 1-10 的活跃度换算成 (随机动作间隔ms, 触发概率, 移动距离px)。"""
+    level = max(ACTIVITY_MIN, min(ACTIVITY_MAX, int(level)))
+    interval = 9000 - (level - 1) * 700
+    chance = 0.03 + (level - 1) * 0.055
+    distance = 30 + (level - 1) * 12
+    return interval, chance, distance
 
 
 class ChatDialog(QDialog):
@@ -104,7 +153,7 @@ class PetCanvas(QWidget):
         self.acting = False
         self.animator = SpriteAnimator(self)
         self.animator.frame_changed.connect(self.update)
-        self._scaled: tuple[tuple[int, int, int], QPixmap] | None = None
+        self._scaled: tuple[QPixmap, QSize, QPixmap] | None = None
 
     @property
     def has_sprite(self) -> bool:
@@ -126,6 +175,13 @@ class PetCanvas(QWidget):
         if self.has_sprite:
             self.animator.show_temporary(state, duration_ms)
 
+    def pin_expression(self, state: str) -> None:
+        if self.has_sprite:
+            self.animator.pin(state)
+
+    def clear_expression(self) -> None:
+        self.animator.unpin()
+
     def act(self) -> None:
         self.acting = True
         self.update()
@@ -144,11 +200,11 @@ class PetCanvas(QWidget):
         self._paint_placeholder()
 
     def _paint_sprite(self, pixmap: QPixmap) -> None:
-        key = (pixmap.cacheKey(), self.width(), self.height())
-        if self._scaled is None or self._scaled[0] != key:
+        # 用 pixmap 对象本身 + 画布尺寸做缓存标识，避免依赖 cacheKey 可能的重用
+        if self._scaled is None or self._scaled[0] is not pixmap or self._scaled[1] != self.size():
             scaled = pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._scaled = (key, scaled)
-        scaled = self._scaled[1]
+            self._scaled = (pixmap, self.size(), scaled)
+        scaled = self._scaled[2]
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.drawPixmap((self.width() - scaled.width()) // 2, self.height() - scaled.height(), scaled)
@@ -160,7 +216,7 @@ class PetCanvas(QWidget):
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = PLACEHOLDER_SIZE
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = PLACEHOLDER_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
@@ -184,21 +240,52 @@ class PetWindow(QWidget):
             assets = CharacterAssets.load(folder)
             if assets is not None: break
         self.assets = assets; self.sprite_size = assets.size if assets is not None else PLACEHOLDER_SIZE
+        self.activity = character_activity(data); self.pinned_expression = None
+        self.wander.setInterval(motion_profile(self.activity)[0])
+        if not self.wander.isActive(): self.wander.start()
         self.canvas.set_assets(assets); self._sync_geometry()
         if folders and assets is None: self.say('立绘不可用，已使用内置形象', 3000)
+    def _set_expression(self, name: str | None) -> None:
+        """固定显示某个表情立绘；恢复默认时回到默认立绘并重新开启随机动作。"""
+        if name is not None and (self.assets is None or not self.assets.has(name)):
+            return
+        self.pinned_expression = name
+        if name is None:
+            self.canvas.clear_expression(); self._restore_state(); self.wander.start(); self.say('已恢复默认形象')
+        else:
+            self.wander.stop(); self.canvas.pin_expression(name); self.say(f"已切换为{CharacterAssets.expression_label(name)}")
+    def _build_expression_menu(self, menu: QMenu) -> None:
+        # 必须显式构造并持有引用：addMenu(str) 返回的子菜单会被 PySide 回收，导致子菜单失效
+        submenu = QMenu('表情', menu); submenu.setStyleSheet(MENU_QSS)
+        submenu.setWindowFlags(submenu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint); submenu.setAttribute(Qt.WA_TranslucentBackground)
+        menu.addMenu(submenu); self._expression_menu = submenu
+        restore = submenu.addAction('恢复默认'); restore.setCheckable(True); restore.setChecked(self.pinned_expression is None); restore.triggered.connect(lambda: self._set_expression(None))
+        submenu.addSeparator()
+        expressions = self.assets.expressions if self.assets is not None else []
+        if not expressions:
+            empty = submenu.addAction('暂无表情素材'); empty.setEnabled(False); return
+        for expression in expressions:
+            action = submenu.addAction(CharacterAssets.expression_label(expression)); action.setCheckable(True); action.setChecked(self.pinned_expression == expression); action.triggered.connect(lambda checked=False, target=expression: self._set_expression(target))
     def _base_state(self) -> str:
         return 'Focus' if self.tick.isActive() else 'Idle'
     def _restore_state(self) -> None:
         self.canvas.set_state(self._base_state())
     def _on_wander_finished(self) -> None:
         self._restore_state()
+    def _build_context_menu(self) -> QMenu:
+        d=load_settings(); movable=d['motion']['mode']=='movable'; m=styled_menu(self)
+        a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator()
+        self._build_expression_menu(m); m.addSeparator()
+        a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.tick.isActive() else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.tick.isActive() else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
+        return m
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
-        d=load_settings(); movable=d['motion']['mode']=='movable'; m=QMenu(self); m.setStyleSheet('QMenu { background:white; border:1px solid #E9E5F1; border-radius:10px; padding:6px; } QMenu::item { padding:8px 34px 8px 12px; border-radius:7px; } QMenu::item:selected { background:#F0EDFB; color:#6D5DC0; }')
-        a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator(); a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.tick.isActive() else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.tick.isActive() else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings); m.exec(e.globalPos())
+        self._build_context_menu().exec(e.globalPos())
     def mousePressEvent(self,e:QMouseEvent)->None:
         if e.button()==Qt.LeftButton: self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft(); self.canvas.set_state('Drag')
     def mouseMoveEvent(self,e:QMouseEvent)->None:
-        if self.drag and e.buttons()&Qt.LeftButton: self.move(e.globalPosition().toPoint()-self.drag); self.timer_window.place()
+        if self.drag and e.buttons()&Qt.LeftButton:
+            position=e.globalPosition().toPoint()-self.drag
+            self.canvas.set_state('Drag', mirrored=drag_mirrored(position.x()-self.x())); self.move(position); self.timer_window.place()
     def mouseReleaseEvent(self,e:QMouseEvent)->None:
         if e.button()==Qt.LeftButton: self.drag=None; self._restore_state()
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
@@ -218,8 +305,10 @@ class PetWindow(QWidget):
         self.remaining-=1; self._timer_text()
         if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.canvas.set_state('Idle'); self.say('专注完成！',5000)
     def _wander(self)->None:
-        if load_settings()['motion']['mode']!='movable' or self.drag or random.random()>.28:return
-        area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-70,70))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-35,35)))); self.canvas.set_state('Move', mirrored=target.x()<self.x()); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
+        if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
+        _, chance, distance = motion_profile(self.activity)
+        if random.random()>chance: return
+        area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-distance,distance))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-distance//2,distance//2)))); self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
     def say(self,text:str,duration:int=2300)->None:
         self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide); self.canvas.show_temporary('Talk',duration)
 

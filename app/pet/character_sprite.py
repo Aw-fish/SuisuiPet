@@ -11,12 +11,26 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QPixmap, QTransform
+from PySide6.QtGui import QPixmap
 
 FRAME_PATTERN = re.compile(r"^(?P<name>[A-Za-z]+)(?P<index>\d*)$")
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 DEFAULT_NAME = "Default"
+
+#: 属于"动作"的素材名，其余均为整张立绘的表情
+ACTION_NAMES = frozenset({"Default", "Idle", "Move", "Talk", "Focus", "Drag"})
+
+#: 表情素材的中文显示名（未知表情直接显示原名）
+EXPRESSION_LABELS: dict[str, str] = {
+    "Blink": "眨眼",
+    "Happy": "开心",
+    "Sad": "难过",
+    "Angry": "生气",
+    "Surprised": "惊讶",
+    "Think": "思考",
+    "Normal": "平常",
+}
 
 #: 动作名 -> 兜底链，取第一个存在的素材
 FALLBACKS: dict[str, tuple[str, ...]] = {
@@ -30,6 +44,15 @@ FALLBACKS: dict[str, tuple[str, ...]] = {
 #: 扁平命名没有 manifest 承载帧率，播放速度集中定义在这里
 FPS: dict[str, int] = {"Idle": 5, "Move": 10, "Talk": 9, "Focus": 4, "Drag": 8}
 DEFAULT_FPS = 6
+
+
+def mirror(pixmap: QPixmap) -> QPixmap:
+    """精确水平镜像，避免仿射变换带来的插值模糊。"""
+    image = pixmap.toImage()
+    flipped = getattr(image, "flipped", None)
+    if flipped is not None:
+        return QPixmap.fromImage(flipped(Qt.Horizontal))
+    return QPixmap.fromImage(image.mirrored(True, False))
 
 
 def has_transparency(pixmap: QPixmap) -> bool:
@@ -116,6 +139,15 @@ class CharacterAssets:
     def actions(self) -> list[str]:
         return sorted(self._frames)
 
+    @property
+    def expressions(self) -> list[str]:
+        """整张全身立绘的表情（按右键菜单展示顺序排列）。"""
+        return sorted(name for name in self._frames if name not in ACTION_NAMES)
+
+    @staticmethod
+    def expression_label(name: str) -> str:
+        return EXPRESSION_LABELS.get(name, name)
+
     def has(self, state: str) -> bool:
         return state in self._frames
 
@@ -133,10 +165,7 @@ class CharacterAssets:
         if not mirrored:
             return self._frames[name]
         if name not in self._mirrored:
-            flip = QTransform().scale(-1, 1)
-            self._mirrored[name] = [
-                pixmap.transformed(flip, Qt.SmoothTransformation) for pixmap in self._frames[name]
-            ]
+            self._mirrored[name] = [mirror(pixmap) for pixmap in self._frames[name]]
         return self._mirrored[name]
 
     def is_animated(self, state: str) -> bool:
