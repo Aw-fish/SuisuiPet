@@ -1,29 +1,23 @@
-"""Default settings and persistence helpers."""
+"""全局设置与持久化。
+
+``data/settings.json`` 只保存全局偏好与角色注册表；每个角色的具体配置存在
+``data/characters/<名字>/character.json``（见 :mod:`app.characters`）。
+旧版把角色配置内嵌在 settings.json 里的结构会在加载时自动迁移。
+"""
 
 from __future__ import annotations
 
 import json
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-SETTINGS_PATH = ROOT_DIR / "data" / "settings.json"
-
-DEFAULT_CHARACTER: dict[str, Any] = {
-    "format": "img",
-    "asset_path": "",
-    "model": "",
-    "api_key": "",
-    "system_prompt": "",
-    "activity": 5,
-}
+from app import characters
+from app.paths import SETTINGS_PATH
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "character": {
-        "selected": "Suisui",
-        "items": {"Suisui": deepcopy(DEFAULT_CHARACTER)},
-    },
+    "character": {"selected": "Suisui", "registered": ["Suisui"]},
     "conversation": {"show_floating_dialog": False},
     "motion": {"mode": "stationary"},
     "tools": {"pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": True},
@@ -39,46 +33,77 @@ def _merge(target: dict[str, Any], saved: dict[str, Any]) -> None:
             target[key] = value
 
 
-def _migrate_legacy(saved: dict[str, Any]) -> None:
-    """Move pre-per-character conversation fields into a character entry."""
-    character = saved.get("character")
-    conversation = saved.get("conversation")
-    if not isinstance(character, dict) or not isinstance(conversation, dict):
-        return
-    if "items" in character:
-        return
-    name = character.get("selected") or "Suisui"
-    character["items"] = {
-        name: {
-            "format": "img",
+def _migrate_character_entry(name: str, info: dict[str, Any]) -> str:
+    """把旧版内嵌的角色配置搬进 ``data/characters/<名字>/``。"""
+    real = characters.ensure_character(name)
+    sprites = characters.sprite_dir(real)
+    source = str(info.get("asset_path", "")).strip()
+    if source:
+        source_path = Path(source)
+        if source_path.is_dir() and source_path.resolve() != sprites.resolve():
+            sprites.mkdir(parents=True, exist_ok=True)
+            for entry in sorted(source_path.iterdir()):
+                if not entry.is_file():
+                    continue
+                target = sprites / entry.name
+                if target.exists():
+                    target.unlink()
+                shutil.move(str(entry), str(target))
+            try:
+                source_path.rmdir()
+            except OSError:
+                pass
+    characters.save_character(
+        real,
+        {
+            "name": real,
+            "format": info.get("format", "img"),
+            "asset": characters.SPRITE_DIRNAME,
             "asset_path": "",
-            "model": conversation.get("model", ""),
-            "api_key": conversation.get("api_key", ""),
-            "system_prompt": conversation.get("system_prompt", ""),
-        }
-    }
-    for key in ("model", "api_key", "system_prompt", "api_url"):
-        conversation.pop(key, None)
+            "model": info.get("model", ""),
+            "api_key": info.get("api_key", ""),
+            "system_prompt": info.get("system_prompt", ""),
+            "activity": info.get("activity", 5),
+        },
+    )
+    return real
 
 
-def _normalize_characters(settings: dict[str, Any]) -> None:
-    """Ensure every character entry carries the full default field set."""
-    items = settings["character"].setdefault("items", {})
-    for name, info in list(items.items()):
-        merged = deepcopy(DEFAULT_CHARACTER)
-        if isinstance(info, dict):
-            merged.update(info)
-        items[name] = merged
-    if not items:
-        items["Suisui"] = deepcopy(DEFAULT_CHARACTER)
-    if settings["character"].get("selected") not in items:
-        settings["character"]["selected"] = next(iter(items))
+def _migrate_legacy_characters(saved: dict[str, Any]) -> None:
+    """旧结构把角色数据内嵌在 settings.json，这里一次性拆分到角色文件夹。"""
+    character = saved.get("character")
+    if not isinstance(character, dict) or "items" not in character:
+        return
+    items = character.pop("items")
+    registered: list[str] = []
+    if isinstance(items, dict):
+        for raw_name, raw_info in items.items():
+            info = raw_info if isinstance(raw_info, dict) else {}
+            registered.append(_migrate_character_entry(str(raw_name), info))
+    character["registered"] = registered
+    if character.get("selected") not in registered:
+        character["selected"] = registered[0] if registered else ""
+
+
+def _normalize(settings: dict[str, Any]) -> None:
+    """保证注册表里只剩真实存在的角色，并选出一个有效角色。"""
+    character = settings.setdefault("character", {})
+    registered: list[str] = []
+    for raw in character.get("registered") or []:
+        name = str(raw).strip()
+        if name and name not in registered and characters.character_dir(name).is_dir():
+            registered.append(name)
+    if not registered:
+        registered = [str(character.get("selected") or "").strip() or "Suisui"]
+    character["registered"] = registered
+    if character.get("selected") not in registered:
+        character["selected"] = registered[0]
 
 
 def load_settings() -> dict[str, Any]:
     """Load user settings, falling back to safe defaults."""
     settings = deepcopy(DEFAULT_SETTINGS)
-    if not SETTINGS_PATH.exists():
+    if not SETTINGS_PATH.is_file():
         return settings
     try:
         saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -86,19 +111,17 @@ def load_settings() -> dict[str, Any]:
         return settings
     if not isinstance(saved, dict):
         return settings
-    _migrate_legacy(saved)
+    _migrate_legacy_characters(saved)
     for group, values in saved.items():
         if group in settings and isinstance(values, dict):
             _merge(settings[group], values)
-    _normalize_characters(settings)
+    _normalize(settings)
     return settings
 
 
 def save_settings(settings: dict[str, Any]) -> None:
-    """Persist settings inside the project data directory."""
-    SETTINGS_PATH.parent.mkdir(exist_ok=True)
+    """Persist global settings inside the project data directory."""
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_PATH.write_text(
         json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-

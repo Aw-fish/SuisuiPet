@@ -1,9 +1,10 @@
 """PySide6 settings window and system-tray integration."""
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from copy import deepcopy
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices
 
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
@@ -11,9 +12,35 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon, QTextEdit,
     QVBoxLayout, QWidget,
 )
-from app.config import DEFAULT_CHARACTER, load_settings, save_settings
-from app.pet.character_sprite import default_art_usable
+from app import characters
+from app.config import load_settings, save_settings
 from app.ui.dialogs import StyledDialog
+from app.ui.icons import app_icon
+from app.ui.menus import styled_menu
+
+
+class ComboBox(QComboBox):
+    """下拉框：去掉系统方投影，并把圆角画在弹出容器上，避免露出直角。
+
+    Qt 的弹出列表装在一个 ``QComboBoxPrivateContainer`` 里，`QAbstractItemView`
+    的圆角只会作用于内部列表，容器本身仍是直角底；这里让容器透明、由 QSS
+    自己画圆角卡片，并关掉系统投影。
+    """
+
+    def showPopup(self) -> None:  # noqa: N802 - 覆盖 Qt 虚函数
+        super().showPopup()
+        container = self.view().window()
+        if container.property("suisuiRounded"):
+            return
+        container.setWindowFlags(
+            container.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+        )
+        container.setAttribute(Qt.WA_TranslucentBackground)
+        container.setStyleSheet(
+            "background: white; border: 1px solid #E9E7EF; border-radius: 10px;"
+        )
+        container.setProperty("suisuiRounded", True)
+        container.show()
 
 
 class SettingsWindow(QMainWindow):
@@ -26,9 +53,11 @@ class SettingsWindow(QMainWindow):
         self.animation: QPropertyAnimation | None = None
         self.drag_position: QPoint | None = None
         self._active_character: str | None = None
+        self._character_cache: dict[str, dict] = {}
         self.setWindowTitle("SuisuiPet")
         self.setFixedSize(900, 740)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self._build()
         self._build_tray()
         self._load()
@@ -99,18 +128,24 @@ class SettingsWindow(QMainWindow):
         return QLabel(text, objectName="label")
 
     def _character_page(self) -> QWidget:
-        page, layout = self._page("角色设置", "管理角色资源，并分别配置每个角色使用的 AI 对话服务。")
+        page, layout = self._page("角色设置", "每个角色拥有独立文件夹，包含立绘、对话配置与记忆。")
         layout.addWidget(self._label("角色选择"))
         picker = QHBoxLayout()
         picker.setSpacing(8)
-        self.character = QComboBox()
+        self.character = ComboBox()
         self.character.currentTextChanged.connect(self._on_character_changed)
         self.add_character = QPushButton("添加角色", objectName="mini")
+        self.add_character.setToolTip("新建一个角色文件夹")
         self.add_character.clicked.connect(self._add_character)
+        self.import_character_button = QPushButton("导入角色", objectName="mini")
+        self.import_character_button.setToolTip("复制一个已有的角色文件夹进来")
+        self.import_character_button.clicked.connect(self._import_character)
         self.remove_character = QPushButton("删除角色", objectName="mini")
+        self.remove_character.setToolTip("断开连接或连同数据一起删除")
         self.remove_character.clicked.connect(self._remove_character)
         picker.addWidget(self.character, 1)
         picker.addWidget(self.add_character)
+        picker.addWidget(self.import_character_button)
         picker.addWidget(self.remove_character)
         layout.addLayout(picker)
         layout.addSpacing(10)
@@ -130,13 +165,13 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self._label("模型文件"))
         self.asset_path = QLineEdit()
         self.asset_path.setReadOnly(True)
-        self.asset_path.setPlaceholderText("选择角色图片文件夹（需包含 Default.png）")
-        browse = QPushButton("浏览", objectName="mini")
-        browse.clicked.connect(self._browse_asset)
+        self.asset_path.setPlaceholderText("角色目录下的 sprites 文件夹")
+        self.browse_button = QPushButton("打开目录", objectName="mini")
+        self.browse_button.clicked.connect(self._browse_asset)
         asset_row = QHBoxLayout()
         asset_row.setSpacing(8)
         asset_row.addWidget(self.asset_path, 1)
-        asset_row.addWidget(browse)
+        asset_row.addWidget(self.browse_button)
         layout.addLayout(asset_row)
         layout.addWidget(self._label("AI 模型名称"))
         self.model = QLineEdit()
@@ -200,29 +235,32 @@ class SettingsWindow(QMainWindow):
         layout.addStretch()
         return page
 
-    def _characters(self) -> dict:
-        return self.data["character"]["items"]
+    # ---- 角色目录与配置 ----------------------------------------------------
 
-    @staticmethod
-    def _asset_hint(is_img: bool) -> str:
-        return "选择角色图片文件夹（需包含 Default.png）" if is_img else "选择 Live2D 模型文件（*.json）"
+    def _registered(self) -> list[str]:
+        return self.data["character"]["registered"]
+
+    def _character_info(self, name: str) -> dict:
+        """角色配置先进内存缓存，点「保存设置」时统一写入 character.json。"""
+        if name not in self._character_cache:
+            self._character_cache[name] = characters.load_character(name)
+        return self._character_cache[name]
 
     def _refresh_character_combo(self, selected: str) -> None:
         self.character.blockSignals(True)
         self.character.clear()
-        self.character.addItems(list(self._characters().keys()))
+        self.character.addItems(self._registered())
         self.character.setCurrentText(selected)
         self.character.blockSignals(False)
         self._active_character = selected
         self._load_character_fields(selected)
 
     def _load_character_fields(self, name: str) -> None:
-        info = self._characters().get(name) or deepcopy(DEFAULT_CHARACTER)
+        info = self._character_info(name)
         is_img = info.get("format", "img") != "live2d"
         self.img_format.setChecked(is_img)
         self.live2d_format.setChecked(not is_img)
-        self.asset_path.setPlaceholderText(self._asset_hint(is_img))
-        self.asset_path.setText(str(info.get("asset_path", "")))
+        self._show_asset_target(name, info)
         self.model.setText(str(info.get("model", "")))
         self.key.setText(str(info.get("api_key", "")))
         self.prompt.setPlainText(str(info.get("system_prompt", "")))
@@ -233,81 +271,145 @@ class SettingsWindow(QMainWindow):
         self.activity.setValue(max(1, min(10, activity)))
         self._on_activity_changed(self.activity.value())
 
+    def _show_asset_target(self, name: str, info: dict) -> None:
+        """img 格式固定指向角色目录下的 sprites，live2d 指向所选模型文件。"""
+        if info.get("format", "img") != "live2d":
+            self.asset_path.setText(str(characters.sprite_dir(name, info)))
+            self.browse_button.setText("打开目录")
+            self.browse_button.setToolTip("打开该角色的立绘文件夹")
+        else:
+            self.asset_path.setText(str(info.get("asset_path", "")))
+            self.browse_button.setText("浏览")
+            self.browse_button.setToolTip("选择 Live2D 模型文件（*.json）")
+
     def _store_character_fields(self, name: str) -> None:
-        info = self._characters().get(name)
-        if info is None:
+        if not name or name not in self._registered():
             return
+        info = self._character_info(name)
+        is_img = self.img_format.isChecked()
         info.update({
-            "format": "img" if self.img_format.isChecked() else "live2d",
-            "asset_path": self.asset_path.text().strip(),
+            "format": "img" if is_img else "live2d",
+            "asset": characters.SPRITE_DIRNAME,
+            "asset_path": "" if is_img else self.asset_path.text().strip(),
             "model": self.model.text().strip(),
             "api_key": self.key.text().strip(),
             "system_prompt": self.prompt.toPlainText().strip(),
             "activity": self.activity.value(),
         })
 
+    def _flush_characters(self) -> None:
+        for name in self._registered():
+            info = self._character_cache.get(name)
+            if info is not None:
+                characters.save_character(name, info)
+
+    def _activate(self, name: str) -> None:
+        """切换当前角色，并把注册表立即写入 settings.json。"""
+        self.data["character"]["selected"] = name
+        self._flush_characters()
+        save_settings(self.data)
+        self._refresh_character_combo(name)
+
     def _on_format_changed(self) -> None:
-        if not hasattr(self, "asset_path"):
+        if not hasattr(self, "asset_path") or not self._active_character:
             return
-        is_img = self.img_format.isChecked()
-        self.asset_path.clear()
-        self.asset_path.setPlaceholderText(self._asset_hint(is_img))
+        info = self._character_info(self._active_character)
+        info["format"] = "img" if self.img_format.isChecked() else "live2d"
+        self._show_asset_target(self._active_character, info)
 
     def _on_character_changed(self, name: str) -> None:
         if not name or name == self._active_character:
             return
-        if self._active_character in self._characters():
+        if self._active_character in self._registered():
             self._store_character_fields(self._active_character)
         self._active_character = name
         self._load_character_fields(name)
 
     def _add_character(self) -> None:
-        name = StyledDialog.ask_text(self, "添加角色", "为新角色起一个名字，之后可以单独配置它的立绘与对话服务。", placeholder="例如：Suisui")
+        name = StyledDialog.ask_text(
+            self,
+            "添加角色",
+            "为新角色创建一个独立文件夹，立绘、对话配置与记忆都会放在里面。",
+            placeholder="例如：Suisui",
+        )
         if name is None:
             return
-        if not name:
-            StyledDialog.notice(self, "添加角色", "角色名称不能为空。")
+        name = name.strip()
+        if not characters.is_valid_name(name):
+            StyledDialog.notice(self, "添加角色", '角色名不能为空，也不能包含 \\ / : * ? " < > | 这些字符。')
             return
-        items = self._characters()
-        if name in items:
-            StyledDialog.notice(self, "添加角色", f"角色“{name}”已存在。")
+        self._store_character_fields(self._active_character or "")
+        if name in self._registered():
+            StyledDialog.notice(self, "添加角色", f"角色“{name}”已经在列表里了。")
             return
-        if self._active_character in items:
-            self._store_character_fields(self._active_character)
-        items[name] = deepcopy(DEFAULT_CHARACTER)
-        self.data["character"]["selected"] = name
-        self._refresh_character_combo(name)
+        if characters.character_dir(name).is_dir():
+            # 之前「断开连接」保留下来的文件夹，直接重新挂上
+            characters.ensure_character(name)
+        else:
+            name = characters.create_character(name)
+        self._registered().append(name)
+        self._character_cache.pop(name, None)
+        self._activate(name)
+
+    def _import_character(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择角色文件夹", str(Path.home()))
+        if not folder:
+            return
+        self._store_character_fields(self._active_character or "")
+        try:
+            name = characters.import_character(folder)
+        except (OSError, ValueError) as exc:
+            StyledDialog.notice(self, "导入角色", f"导入失败：{exc}")
+            return
+        self._registered().append(name)
+        self._character_cache.pop(name, None)
+        self._activate(name)
 
     def _remove_character(self) -> None:
-        items = self._characters()
         name = self._active_character or self.data["character"]["selected"]
-        if name not in items:
+        if name not in self._registered():
             return
-        if len(items) <= 1:
+        if len(self._registered()) <= 1:
             StyledDialog.notice(self, "删除角色", "至少需要保留一个角色。")
             return
-        if not StyledDialog.confirm(self, "删除角色", f"确定要删除角色“{name}”吗？该角色的立绘与对话配置会一并移除。"):
+        choice = StyledDialog.choose(
+            self,
+            "删除角色",
+            f"角色“{name}”的文件夹里包含立绘、对话配置与记忆。\n\n"
+            "· 断开连接：只从列表移除，文件夹完整保留，之后用「添加角色」同名即可重新挂上\n"
+            "· 删除数据：连同文件夹一起永久删除，无法恢复",
+            options=(("disconnect", "断开连接", "ghost"), ("delete", "删除数据", "danger")),
+        )
+        if choice is None:
             return
-        items.pop(name)
-        self.data["character"]["selected"] = next(iter(items))
-        self._refresh_character_combo(self.data["character"]["selected"])
+        self._registered().remove(name)
+        self._character_cache.pop(name, None)
+        if choice == "delete":
+            characters.delete_character_data(name)
+        self._activate(self._registered()[0])
 
     def _browse_asset(self) -> None:
+        name = self._active_character
+        if not name:
+            return
+        info = self._character_info(name)
+        if info.get("format", "img") != "live2d":
+            directory = characters.sprite_dir(name, info)
+            directory.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+            return
         current = self.asset_path.text().strip()
-        if self.img_format.isChecked():
-            path = QFileDialog.getExistingDirectory(self, "选择角色图片文件夹", current)
-        else:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "选择 Live2D 模型文件", current, "Live2D 模型 (*.json);;所有文件 (*)"
-            )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 Live2D 模型文件", current, "Live2D 模型 (*.json);;所有文件 (*)"
+        )
         if path:
             self.asset_path.setText(path)
-            if self.img_format.isChecked() and not default_art_usable(path):
-                StyledDialog.notice(self, "立绘不可用", "该文件夹内未找到透明背景的 Default 立绘，桌宠会回退到其他可用形象。")
 
     def _load(self) -> None:
+        self._character_cache.clear()
         c, a, t = self.data["character"], self.data["conversation"], self.data["tools"]
-        selected = c["selected"] if c["selected"] in c["items"] else next(iter(c["items"]))
+        registered = self._registered()
+        selected = c["selected"] if c["selected"] in registered else registered[0]
         c["selected"] = selected
         self._refresh_character_combo(selected)
         self.movable.setChecked(self.data["motion"]["mode"] == "movable")
@@ -316,14 +418,16 @@ class SettingsWindow(QMainWindow):
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
 
     def save(self) -> None:
-        items = self._characters()
-        name = self._active_character if self._active_character in items else next(iter(items))
+        name = self._active_character or self.data["character"]["selected"]
+        if name not in self._registered():
+            name = self._registered()[0]
         self._store_character_fields(name)
         self.data["character"]["selected"] = name
         self.data["conversation"].pop("api_url", None)
         self.data["conversation"]["show_floating_dialog"] = self.floating.isChecked()
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
+        self._flush_characters()
         save_settings(self.data)
         self.settings_saved.emit(self.data)
         self.hide()
@@ -333,10 +437,8 @@ class SettingsWindow(QMainWindow):
         self._load()
 
     def _build_tray(self) -> None:
-        pixmap = QPixmap(64, 64); pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap); painter.setRenderHint(QPainter.Antialiasing); painter.setPen(Qt.NoPen); painter.setBrush(QColor(self.ACCENT)); painter.drawEllipse(6, 6, 52, 52); painter.end()
-        self.tray = QSystemTrayIcon(QIcon(pixmap), self); self.tray.setToolTip("SuisuiPet")
-        menu = QMenu(self); menu.setObjectName("trayMenu"); menu.setStyleSheet("QMenu#trayMenu { background: #FFFFFF; border: 1px solid #ECEAF2; border-radius: 10px; padding: 6px; } QMenu#trayMenu::item { color: #4D485A; border-radius: 7px; padding: 8px 34px 8px 12px; } QMenu#trayMenu::item:selected { background: #F0EDFB; color: #6D5DC0; } QMenu#trayMenu::separator { height: 1px; background: #EEEAF4; margin: 5px 8px; }"); open_action = QAction("打开设置", self); open_action.triggered.connect(self.show_from_tray)
+        self.tray = QSystemTrayIcon(app_icon(), self); self.tray.setToolTip("SuisuiPet")
+        menu = styled_menu(self); open_action = QAction("打开设置", self); open_action.triggered.connect(self.show_from_tray)
         quit_action = QAction("退出", self); quit_action.triggered.connect(QApplication.instance().quit)
         menu.addAction(open_action); menu.addSeparator(); menu.addAction(quit_action); self.tray.setContextMenu(menu); self.tray.show()
 
@@ -364,7 +466,7 @@ class SettingsWindow(QMainWindow):
 
     @classmethod
     def _qss(cls) -> str:
-        return f'''QWidget#root {{ background:white; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:6px; }} QLineEdit,QComboBox,QSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }} QPushButton#mini {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:9px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:9px 12px; }} QPushButton#mini:hover {{ background:#EBE6FA; }} QPushButton#mini:pressed {{ background:#E2DAF8; }} QLineEdit:read-only {{ background:#FAFAFD; color:#7A7488; border-color:#EFEDF5; }} QLabel#chip {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:8px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:5px 0; }} QSlider::groove:horizontal {{ height:6px; background:#EFEDF7; border-radius:3px; }} QSlider::sub-page:horizontal {{ background:{cls.ACCENT}; border-radius:3px; }} QSlider::add-page:horizontal {{ background:#EFEDF7; border-radius:3px; }} QSlider::handle:horizontal {{ width:12px; height:12px; margin:-5px 0; background:white; border:2px solid {cls.ACCENT}; border-radius:8px; }} QSlider::handle:horizontal:hover {{ border-color:#806CD9; }}'''
+        return f'''QWidget#root {{ background:white; border-radius:18px; }} QFrame#sidebar {{ background:#FAFAFD; border-top-left-radius:18px; border-bottom-left-radius:18px; }} QLabel#brand {{ color:#423C64; font:700 19px "Microsoft YaHei UI"; padding:3px 8px; }} QLabel#hint, QLabel#description {{ color:#9993A5; font:10px "Microsoft YaHei UI"; padding:0 8px; }} QPushButton#nav {{ border:0; border-radius:10px; background:transparent; color:#79738E; padding:12px 14px; text-align:left; }} QPushButton#nav:hover {{ background:#F0EDFB; }} QPushButton#nav:checked {{ background:#EEEAFE; color:#6D5DC0; font-weight:600; }} QLabel#title {{ color:#302C40; font:600 22px "Microsoft YaHei UI"; }} QLabel#label {{ color:#625D70; font:600 11px "Microsoft YaHei UI"; margin-top:6px; }} QLineEdit,QComboBox,QSpinBox,QTextEdit {{ background:white; border:1px solid #E9E7EF; border-radius:9px; padding:8px 10px; color:#403C4B; min-height:20px; }} QComboBox::drop-down {{ width:34px; border:0; border-left:1px solid #F0EEF4; }} QSpinBox::up-button,QSpinBox::down-button {{ width:28px; border:0; background:#F7F5FB; }} QSpinBox::up-button {{ border-top-right-radius:8px; }} QSpinBox::down-button {{ border-bottom-right-radius:8px; }} QLineEdit:focus,QComboBox:focus,QSpinBox:focus,QTextEdit:focus {{ border-color:#B8AAF3; }} QRadioButton {{ color:#494451; padding:5px 0; }} QPushButton#control {{ border:0; border-radius:8px; background:transparent; color:#A19CAD; min-width:28px; max-width:28px; min-height:28px; }} QPushButton#control:hover {{ background:#F5F3FA; }} QPushButton#save {{ background:{cls.ACCENT}; border:0; border-radius:10px; color:white; font-weight:600; padding:11px 24px; }} QPushButton#save:hover {{ background:#806CD9; }} QPushButton#mini {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:9px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:9px 12px; }} QPushButton#mini:hover {{ background:#EBE6FA; }} QPushButton#mini:pressed {{ background:#E2DAF8; }} QLineEdit:read-only {{ background:#FAFAFD; color:#7A7488; border-color:#EFEDF5; }} QLabel#chip {{ background:#F4F1FB; border:1px solid #E9E5F5; border-radius:8px; color:#6D5DC0; font:600 11px "Microsoft YaHei UI"; padding:5px 0; }} QSlider::groove:horizontal {{ height:6px; background:#EFEDF7; border-radius:3px; }} QSlider::sub-page:horizontal {{ background:{cls.ACCENT}; border-radius:3px; }} QSlider::add-page:horizontal {{ background:#EFEDF7; border-radius:3px; }} QSlider::handle:horizontal {{ width:12px; height:12px; margin:-5px 0; background:white; border:2px solid {cls.ACCENT}; border-radius:8px; }} QSlider::handle:horizontal:hover {{ border-color:#806CD9; }} QComboBox QAbstractItemView {{ background:transparent; border:0; border-radius:10px; padding:4px; outline:0; color:#403C4B; selection-background-color:#F0EDFB; selection-color:#6D5DC0; }} QComboBox QAbstractItemView::item {{ min-height:22px; padding:4px 8px; }}'''
 
 
 

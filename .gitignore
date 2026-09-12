@@ -4,3 +4,6 @@ __pycache__/
 
 # User-specific runtime configuration
 data/settings.json
+
+# 角色记忆（对话历史属于私人数据，不进仓库）
+data/characters/*/memory/

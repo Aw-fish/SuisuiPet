@@ -4,30 +4,21 @@ import random
 from pathlib import Path
 from typing import Callable
 from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt
-from PySide6.QtGui import QColor, QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
-from app.config import ROOT_DIR, load_settings, save_settings
+from app import characters
+from app.config import load_settings, save_settings
 from app.pet.animator import SpriteAnimator
 from app.pet.character_sprite import CharacterAssets
+from app.ui.dialogs import StyledDialog
+from app.ui.menus import styled_menu
 
 #: 立绘在桌面上的显示高度（像素）
 SPRITE_HEIGHT = 224
 #: 角色上方气泡提示占用的高度
 BUBBLE_HEIGHT = 34
-#: 没有立绘素材时使用的手绘占位尺寸
-PLACEHOLDER_SIZE = QSize(168, 168)
-
-#: 右键菜单样式，子菜单复用同一份
-MENU_QSS = 'QMenu { background:white; border:1px solid #E9E5F1; border-radius:10px; padding:6px; } QMenu::item { padding:8px 34px 8px 12px; border-radius:7px; } QMenu::item:selected { background:#F0EDFB; color:#6D5DC0; } QMenu::item:disabled { color:#BEB9C9; } QMenu::separator { height:1px; background:#F0EDF5; margin:5px 8px; }'
-
-
-def styled_menu(parent: QWidget | None = None) -> QMenu:
-    """圆角菜单：关闭系统方形投影并开启透明，避免阴影露出直角。"""
-    menu = QMenu(parent)
-    menu.setStyleSheet(MENU_QSS)
-    menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
-    menu.setAttribute(Qt.WA_TranslucentBackground)
-    return menu
+#: 找不到立绘时的窗口尺寸（窗口会被隐藏，仅用于几何计算）
+DEFAULT_CANVAS_SIZE = QSize(168, 168)
 
 ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
 
@@ -48,15 +39,24 @@ def drag_mirrored(delta_x: int) -> bool:
     return delta_x < 0
 
 
+def current_character(data: dict) -> tuple[str, dict]:
+    """返回 (角色名, 角色配置)；没有选中角色时返回空配置。"""
+    name = str(data.get("character", {}).get("selected") or "").strip()
+    if not name:
+        return "", {}
+    return name, characters.load_character(name)
+
+
 def character_folders(data: dict) -> list[Path]:
-    """当前角色的候选立绘文件夹：先用配置路径，再自动探测 data/img1、data/img。"""
-    character = data.get("character", {})
-    info = character.get("items", {}).get(character.get("selected"), {})
-    if info.get("format", "img") != "img":
+    """当前角色的候选立绘文件夹：外部路径优先，其次是角色目录下的 sprites。"""
+    name, info = current_character(data)
+    if not name or info.get("format", "img") != "img":
         return []
+    candidates: list[Path] = []
     configured = str(info.get("asset_path", "")).strip()
-    candidates = [Path(configured)] if configured else []
-    candidates += [ROOT_DIR / "data" / "img1", ROOT_DIR / "data" / "img"]
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(characters.sprite_dir(name, info))
     folders: list[Path] = []
     for candidate in candidates:
         if candidate.is_dir() and candidate not in folders:
@@ -66,8 +66,7 @@ def character_folders(data: dict) -> list[Path]:
 
 def character_activity(data: dict) -> int:
     """读取当前角色的活跃度（1-10），越界或非法值回落到默认。"""
-    character = data.get("character", {})
-    info = character.get("items", {}).get(character.get("selected"), {})
+    _, info = current_character(data)
     try:
         return max(ACTIVITY_MIN, min(ACTIVITY_MAX, int(info.get("activity", ACTIVITY_DEFAULT))))
     except (TypeError, ValueError):
@@ -146,11 +145,10 @@ class TimerWindow(QWidget):
 
 
 class PetCanvas(QWidget):
-    """Renders img sprite frames, falling back to the built-in drawing when absent."""
+    """只负责绘制立绘帧；没有素材时保持完全透明。"""
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
-        self.acting = False
         self.animator = SpriteAnimator(self)
         self.animator.frame_changed.connect(self.update)
         self._scaled: tuple[QPixmap, QSize, QPixmap] | None = None
@@ -168,8 +166,6 @@ class PetCanvas(QWidget):
     def set_state(self, state: str, mirrored: bool = False) -> None:
         if self.has_sprite:
             self.animator.set_state(state, mirrored=mirrored)
-        elif state == "Move":
-            self.act()
 
     def show_temporary(self, state: str, duration_ms: int) -> None:
         if self.has_sprite:
@@ -182,22 +178,10 @@ class PetCanvas(QWidget):
     def clear_expression(self) -> None:
         self.animator.unpin()
 
-    def act(self) -> None:
-        self.acting = True
-        self.update()
-        if not self.has_sprite:
-            QTimer.singleShot(650, self.stop)
-
-    def stop(self) -> None:
-        self.acting = False
-        self.update()
-
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         pixmap = self.animator.current()
         if pixmap is not None:
             self._paint_sprite(pixmap)
-            return
-        self._paint_placeholder()
 
     def _paint_sprite(self, pixmap: QPixmap) -> None:
         # 用 pixmap 对象本身 + 画布尺寸做缓存标识，避免依赖 cacheKey 可能的重用
@@ -210,13 +194,10 @@ class PetCanvas(QWidget):
         p.drawPixmap((self.width() - scaled.width()) // 2, self.height() - scaled.height(), scaled)
         p.end()
 
-    def _paint_placeholder(self) -> None:
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setPen(QPen(QColor('#665B82'), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)); p.setBrush(QColor('#F1EDFF')); p.drawEllipse(26,24,116,108); p.drawEllipse(48,119,72,48); p.setBrush(Qt.NoBrush); p.drawEllipse(59,67,8,9); p.drawEllipse(102,67,8,9); p.drawArc(75,78,20,18,225,2400); p.drawLine(46,38,35,14); p.drawLine(122,38,134,14); p.drawLine(49,130,27,145 if self.acting else 138); p.drawLine(119,130,142,112 if self.acting else 138); p.end()
-
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = PLACEHOLDER_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
@@ -228,7 +209,7 @@ class PetWindow(QWidget):
         if self.assets is not None:
             width = max(120, round(SPRITE_HEIGHT * self.sprite_size.width() / self.sprite_size.height())); height = SPRITE_HEIGHT
         else:
-            width, height = PLACEHOLDER_SIZE.width(), PLACEHOLDER_SIZE.height()
+            width, height = DEFAULT_CANVAS_SIZE.width(), DEFAULT_CANVAS_SIZE.height()
         self.setFixedSize(width, height + BUBBLE_HEIGHT); self.canvas.setGeometry(0, BUBBLE_HEIGHT, width, height); self.bubble.setGeometry(8, 0, width - 16, BUBBLE_HEIGHT)
         if self.isVisible(): self._clamp_to_screen()
     def _clamp_to_screen(self) -> None:
@@ -239,12 +220,31 @@ class PetWindow(QWidget):
         for folder in folders:
             assets = CharacterAssets.load(folder)
             if assets is not None: break
-        self.assets = assets; self.sprite_size = assets.size if assets is not None else PLACEHOLDER_SIZE
+        self.assets = assets; self.sprite_size = assets.size if assets is not None else DEFAULT_CANVAS_SIZE
         self.activity = character_activity(data); self.pinned_expression = None
         self.wander.setInterval(motion_profile(self.activity)[0])
         if not self.wander.isActive(): self.wander.start()
         self.canvas.set_assets(assets); self._sync_geometry()
-        if folders and assets is None: self.say('立绘不可用，已使用内置形象', 3000)
+    def show_pet(self) -> None:
+        """入口调用：有立绘就显示窗口，没有则隐藏并提示一次。"""
+        if self.assets is not None:
+            self._art_warned = None; self.show(); return
+        self.hide()
+        name, info = current_character(load_settings())
+        folder = characters.sprite_dir(name, info) if name else None
+        fingerprint = f"{name}|{folder}"
+        if self._art_warned == fingerprint: return
+        self._art_warned = fingerprint
+        QTimer.singleShot(0, self._warn_missing_art)
+    def _warn_missing_art(self) -> None:
+        name, info = current_character(load_settings())
+        folder = characters.sprite_dir(name, info) if name else None
+        StyledDialog.notice(
+            self, "找不到立绘！",
+            f"角色“{name or '未选择'}”没有可用的立绘。\n\n"
+            f"请把 Default.png 等图片放进：\n{folder or 'data/characters/<角色名>/sprites'}\n\n"
+            "也可以在「设置 → 角色设置」里检查立绘目录或切换角色。",
+        )
     def _set_expression(self, name: str | None) -> None:
         """固定显示某个表情立绘；恢复默认时回到默认立绘并重新开启随机动作。"""
         if name is not None and (self.assets is None or not self.assets.has(name)):
@@ -256,8 +256,7 @@ class PetWindow(QWidget):
             self.wander.stop(); self.canvas.pin_expression(name); self.say(f"已切换为{CharacterAssets.expression_label(name)}")
     def _build_expression_menu(self, menu: QMenu) -> None:
         # 必须显式构造并持有引用：addMenu(str) 返回的子菜单会被 PySide 回收，导致子菜单失效
-        submenu = QMenu('表情', menu); submenu.setStyleSheet(MENU_QSS)
-        submenu.setWindowFlags(submenu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint); submenu.setAttribute(Qt.WA_TranslucentBackground)
+        submenu = styled_menu(menu, '表情')
         menu.addMenu(submenu); self._expression_menu = submenu
         restore = submenu.addAction('恢复默认'); restore.setCheckable(True); restore.setChecked(self.pinned_expression is None); restore.triggered.connect(lambda: self._set_expression(None))
         submenu.addSeparator()
@@ -295,7 +294,8 @@ class PetWindow(QWidget):
     def apply_settings(self, data:dict)->None:
         if data['conversation']['show_floating_dialog']: self.chat.show_near(self)
         else: self.close_chat()
-        self.load_character(data); self.say('设置已保存')
+        self.load_character(data); self.show_pet()
+        if self.isVisible(): self.say('设置已保存')
     def close_chat(self)->None: self.chat.hide()
     def start_pomodoro(self)->None:
         self.remaining=load_settings()['tools']['pomodoro_minutes']*60; self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.canvas.set_state('Focus'); self.say('开始专注')

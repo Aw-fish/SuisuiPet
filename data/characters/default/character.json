@@ -1,0 +1,10 @@
+{
+  "name": "default",
+  "format": "img",
+  "asset": "sprites",
+  "asset_path": "",
+  "model": "",
+  "api_key": "",
+  "system_prompt": "",
+  "activity": 10
+}

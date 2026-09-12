@@ -1,36 +1,38 @@
-"""Generate placeholder sprite sets for the desktop pet.
+"""Generate the placeholder sprite set for one character.
 
 Source of truth: ``data/img/Default.png`` (the artist's line art).
-Outputs two interchangeable variants:
+Output goes inside the character folder so everything belonging to a character
+stays together::
 
-* ``data/img1`` — detail preserved, only matted / cropped / downscaled.
-* ``data/img2`` — line art simplified (binarised, denoised, slightly bolded)
-  so it stays readable when the pet is shown at ~224px tall.
+    data/characters/<角色名>/sprites/
 
-Both folders follow the flat naming convention consumed by
+That folder follows the flat naming convention consumed by
 ``app.pet.character_sprite``::
 
     Default.png  Idle1..3  Move1..4  Talk1..3  Focus1..4  Drag1..2
     Blink.png  Happy.png  Sad.png  Angry.png  Surprised.png  Think.png
 
-The script is idempotent: ``data/img/Default.png`` is never modified and every
-derived file is simply rewritten.
+The script is idempotent: the source art is never modified and every derived
+file is simply rewritten.
 
 Usage::
 
     python tools/make_placeholder_frames.py
+    python tools/make_placeholder_frames.py --character Suisui --simplify
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SOURCE_PATH = ROOT_DIR / "data" / "img" / "Default.png"
-DETAIL_DIR = ROOT_DIR / "data" / "img1"
-SIMPLE_DIR = ROOT_DIR / "data" / "img2"
+CHARACTERS_DIR = ROOT_DIR / "data" / "characters"
+SPRITE_DIRNAME = "sprites"
+DEFAULT_CHARACTER = "Suisui"
 
 TARGET_HEIGHT = 512
 CROP_MARGIN = 0.04
@@ -138,17 +140,21 @@ def build_variant(directory: Path, base: Image.Image) -> list[str]:
 
 
 def main() -> None:
-    if not SOURCE_PATH.exists():
-        raise SystemExit(f"找不到源立绘：{SOURCE_PATH}")
-    with Image.open(SOURCE_PATH) as source:
+    parser = argparse.ArgumentParser(description="生成角色占位立绘")
+    parser.add_argument("--character", default=DEFAULT_CHARACTER, help="角色名（对应 data/characters/<名字>/）")
+    parser.add_argument("--source", default=str(SOURCE_PATH), help="源立绘路径")
+    parser.add_argument("--simplify", action="store_true", help="输出二值化后的简化版线稿")
+    args = parser.parse_args()
+
+    source_path = Path(args.source)
+    if not source_path.is_file():
+        raise SystemExit(f"找不到源立绘：{source_path}")
+    with Image.open(source_path) as source:
         prepared = _crop(_matte(source))
-    variants = {
-        DETAIL_DIR: _resize(prepared),
-        SIMPLE_DIR: _resize(_simplify(prepared)),
-    }
-    for directory, base in variants.items():
-        for line in build_variant(directory, base):
-            print(f"[{directory.name}] {line}")
+    base = _resize(_simplify(prepared) if args.simplify else prepared)
+    target = CHARACTERS_DIR / args.character / SPRITE_DIRNAME
+    for line in build_variant(target, base):
+        print(f"[{args.character}] {line}")
 
 
 if __name__ == "__main__":
