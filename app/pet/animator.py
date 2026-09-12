@@ -1,0 +1,107 @@
+"""Frame playback driver for :class:`~app.pet.character_sprite.CharacterAssets`."""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtGui import QPixmap
+
+from app.pet.character_sprite import CharacterAssets
+
+#: 临时动作（眨眼、说话等）的额外帧率覆盖
+TEMPORARY_FPS: dict[str, int] = {"Blink": 8, "Talk": 9}
+
+
+class SpriteAnimator(QObject):
+    """Advances the current action's frames and supports temporary overrides.
+
+    基础状态由 :meth:`set_state` 决定；:meth:`show_temporary` 用于说话、眨眼这类
+    "播放一段后自动回到基础状态"的动作，优先级高于基础状态。
+    """
+
+    frame_changed = Signal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._assets: CharacterAssets | None = None
+        self._state = "Idle"
+        self._mirrored = False
+        self._index = 0
+        self._override: str | None = None
+        self._override_mirrored = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+        self._expire = QTimer(self)
+        self._expire.setSingleShot(True)
+        self._expire.timeout.connect(self.clear_temporary)
+
+    def set_assets(self, assets: CharacterAssets | None) -> None:
+        self._assets = assets
+        self._override = None
+        self._index = 0
+        self._expire.stop()
+        self._sync_timer()
+        self.frame_changed.emit()
+
+    def set_state(self, state: str, mirrored: bool = False, restart: bool = False) -> None:
+        if self._assets is None:
+            return
+        if state == self._state and mirrored == self._mirrored and not restart:
+            return
+        self._state = state
+        self._mirrored = mirrored
+        self._index = 0
+        self._sync_timer()
+        self.frame_changed.emit()
+
+    def show_temporary(self, state: str, duration_ms: int, mirrored: bool = False) -> None:
+        if self._assets is None or not self._assets.has(state):
+            return
+        self._override = state
+        self._override_mirrored = mirrored
+        self._index = 0
+        self._sync_timer()
+        self._expire.start(max(240, duration_ms))
+        self.frame_changed.emit()
+
+    def clear_temporary(self) -> None:
+        if self._override is None:
+            return
+        self._override = None
+        self._index = 0
+        self._sync_timer()
+        self.frame_changed.emit()
+
+    @property
+    def state(self) -> str:
+        return self._override or self._state
+
+    def current(self) -> QPixmap | None:
+        frames = self._frames()
+        if not frames:
+            return None
+        return frames[self._index % len(frames)]
+
+    def _frames(self) -> list[QPixmap]:
+        if self._assets is None:
+            return []
+        if self._override is not None:
+            return self._assets.frames(self._override, self._override_mirrored)
+        return self._assets.frames(self._state, self._mirrored)
+
+    def _interval(self) -> int:
+        fps = TEMPORARY_FPS.get(self.state, CharacterAssets.fps(self.state))
+        return max(40, round(1000 / fps))
+
+    def _sync_timer(self) -> None:
+        if len(self._frames()) <= 1:
+            self._timer.stop()
+            return
+        self._timer.start(self._interval())
+
+    def _advance(self) -> None:
+        frames = self._frames()
+        if len(frames) <= 1:
+            self._timer.stop()
+            return
+        self._index = (self._index + 1) % len(frames)
+        self.frame_changed.emit()

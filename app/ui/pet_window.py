@@ -1,11 +1,37 @@
-"""Interactive code-drawn desktop pet and its floating utilities."""
+"""Interactive desktop pet window and its floating utilities."""
 from __future__ import annotations
 import random
+from pathlib import Path
 from typing import Callable
-from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QTimer, Qt
-from PySide6.QtGui import QColor, QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPen
+from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt
+from PySide6.QtGui import QColor, QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
-from app.config import load_settings, save_settings
+from app.config import ROOT_DIR, load_settings, save_settings
+from app.pet.animator import SpriteAnimator
+from app.pet.character_sprite import CharacterAssets
+
+#: 立绘在桌面上的显示高度（像素）
+SPRITE_HEIGHT = 224
+#: 角色上方气泡提示占用的高度
+BUBBLE_HEIGHT = 34
+#: 没有立绘素材时使用的手绘占位尺寸
+PLACEHOLDER_SIZE = QSize(168, 168)
+
+
+def character_folders(data: dict) -> list[Path]:
+    """当前角色的候选立绘文件夹：先用配置路径，再自动探测 data/img1、data/img。"""
+    character = data.get("character", {})
+    info = character.get("items", {}).get(character.get("selected"), {})
+    if info.get("format", "img") != "img":
+        return []
+    configured = str(info.get("asset_path", "")).strip()
+    candidates = [Path(configured)] if configured else []
+    candidates += [ROOT_DIR / "data" / "img1", ROOT_DIR / "data" / "img"]
+    folders: list[Path] = []
+    for candidate in candidates:
+        if candidate.is_dir() and candidate not in folders:
+            folders.append(candidate)
+    return folders
 
 
 class ChatDialog(QDialog):
@@ -71,30 +97,110 @@ class TimerWindow(QWidget):
 
 
 class PetCanvas(QWidget):
-    def __init__(self, parent: QWidget) -> None: super().__init__(parent); self.acting = False
-    def act(self) -> None: self.acting = True; self.update(); QTimer.singleShot(650, self.stop)
-    def stop(self) -> None: self.acting = False; self.update()
+    """Renders img sprite frames, falling back to the built-in drawing when absent."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.acting = False
+        self.animator = SpriteAnimator(self)
+        self.animator.frame_changed.connect(self.update)
+        self._scaled: tuple[tuple[int, int, int], QPixmap] | None = None
+
+    @property
+    def has_sprite(self) -> bool:
+        return self.animator.current() is not None
+
+    def set_assets(self, assets: CharacterAssets | None) -> None:
+        self._scaled = None
+        self.animator.set_assets(assets)
+        if assets is not None:
+            self.animator.set_state("Idle", restart=True)
+
+    def set_state(self, state: str, mirrored: bool = False) -> None:
+        if self.has_sprite:
+            self.animator.set_state(state, mirrored=mirrored)
+        elif state == "Move":
+            self.act()
+
+    def show_temporary(self, state: str, duration_ms: int) -> None:
+        if self.has_sprite:
+            self.animator.show_temporary(state, duration_ms)
+
+    def act(self) -> None:
+        self.acting = True
+        self.update()
+        if not self.has_sprite:
+            QTimer.singleShot(650, self.stop)
+
+    def stop(self) -> None:
+        self.acting = False
+        self.update()
+
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        pixmap = self.animator.current()
+        if pixmap is not None:
+            self._paint_sprite(pixmap)
+            return
+        self._paint_placeholder()
+
+    def _paint_sprite(self, pixmap: QPixmap) -> None:
+        key = (pixmap.cacheKey(), self.width(), self.height())
+        if self._scaled is None or self._scaled[0] != key:
+            scaled = pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._scaled = (key, scaled)
+        scaled = self._scaled[1]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.drawPixmap((self.width() - scaled.width()) // 2, self.height() - scaled.height(), scaled)
+        p.end()
+
+    def _paint_placeholder(self) -> None:
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setPen(QPen(QColor('#665B82'), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)); p.setBrush(QColor('#F1EDFF')); p.drawEllipse(26,24,116,108); p.drawEllipse(48,119,72,48); p.setBrush(Qt.NoBrush); p.drawEllipse(59,67,8,9); p.drawEllipse(102,67,8,9); p.drawArc(75,78,20,18,225,2400); p.drawLine(46,38,35,14); p.drawLine(122,38,134,14); p.drawLine(49,130,27,145 if self.acting else 138); p.drawLine(119,130,142,112 if self.acting else 138); p.end()
 
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.animation: QPropertyAnimation | None = None; self.remaining = 0
-        self.setFixedSize(168,192); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
-        self.canvas = PetCanvas(self); self.canvas.setGeometry(0,22,168,168); self.bubble = QLabel(self); self.bubble.setGeometry(10,0,148,35); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
-        self.chat = ChatDialog(self); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._place()
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = PLACEHOLDER_SIZE
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
+        self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
+        self._sync_geometry()
+        self.animation = QPropertyAnimation(self, b'pos', self); self.animation.setDuration(650); self.animation.finished.connect(self._on_wander_finished)
+        self.chat = ChatDialog(self); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self.load_character(load_settings()); self._place()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
+    def _sync_geometry(self) -> None:
+        if self.assets is not None:
+            width = max(120, round(SPRITE_HEIGHT * self.sprite_size.width() / self.sprite_size.height())); height = SPRITE_HEIGHT
+        else:
+            width, height = PLACEHOLDER_SIZE.width(), PLACEHOLDER_SIZE.height()
+        self.setFixedSize(width, height + BUBBLE_HEIGHT); self.canvas.setGeometry(0, BUBBLE_HEIGHT, width, height); self.bubble.setGeometry(8, 0, width - 16, BUBBLE_HEIGHT)
+        if self.isVisible(): self._clamp_to_screen()
+    def _clamp_to_screen(self) -> None:
+        area = self.screen().availableGeometry(); self.move(max(area.left(), min(self.x(), area.right() - self.width())), max(area.top(), min(self.y(), area.bottom() - self.height())))
+    def load_character(self, data: dict) -> None:
+        """按当前角色的 img 立绘文件夹重建素材与窗口尺寸。"""
+        folders = character_folders(data); assets = None
+        for folder in folders:
+            assets = CharacterAssets.load(folder)
+            if assets is not None: break
+        self.assets = assets; self.sprite_size = assets.size if assets is not None else PLACEHOLDER_SIZE
+        self.canvas.set_assets(assets); self._sync_geometry()
+        if folders and assets is None: self.say('立绘不可用，已使用内置形象', 3000)
+    def _base_state(self) -> str:
+        return 'Focus' if self.tick.isActive() else 'Idle'
+    def _restore_state(self) -> None:
+        self.canvas.set_state(self._base_state())
+    def _on_wander_finished(self) -> None:
+        self._restore_state()
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
         d=load_settings(); movable=d['motion']['mode']=='movable'; m=QMenu(self); m.setStyleSheet('QMenu { background:white; border:1px solid #E9E5F1; border-radius:10px; padding:6px; } QMenu::item { padding:8px 34px 8px 12px; border-radius:7px; } QMenu::item:selected { background:#F0EDFB; color:#6D5DC0; }')
         a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator(); a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.tick.isActive() else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.tick.isActive() else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings); m.exec(e.globalPos())
     def mousePressEvent(self,e:QMouseEvent)->None:
-        if e.button()==Qt.LeftButton: self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft()
+        if e.button()==Qt.LeftButton: self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft(); self.canvas.set_state('Drag')
     def mouseMoveEvent(self,e:QMouseEvent)->None:
         if self.drag and e.buttons()&Qt.LeftButton: self.move(e.globalPosition().toPoint()-self.drag); self.timer_window.place()
     def mouseReleaseEvent(self,e:QMouseEvent)->None:
-        if e.button()==Qt.LeftButton: self.drag=None;
+        if e.button()==Qt.LeftButton: self.drag=None; self._restore_state()
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
         if hasattr(self,'timer_window') and self.timer_window.isVisible(): self.timer_window.place()
     def toggle_mode(self)->None:
@@ -102,19 +208,20 @@ class PetWindow(QWidget):
     def apply_settings(self, data:dict)->None:
         if data['conversation']['show_floating_dialog']: self.chat.show_near(self)
         else: self.close_chat()
-        self.say('设置已保存')
+        self.load_character(data); self.say('设置已保存')
     def close_chat(self)->None: self.chat.hide()
     def start_pomodoro(self)->None:
-        self.remaining=load_settings()['tools']['pomodoro_minutes']*60; self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.say('开始专注')
-    def stop_pomodoro(self)->None: self.tick.stop(); self.timer_window.hide(); self.say('番茄钟已停止')
+        self.remaining=load_settings()['tools']['pomodoro_minutes']*60; self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.canvas.set_state('Focus'); self.say('开始专注')
+    def stop_pomodoro(self)->None: self.tick.stop(); self.timer_window.hide(); self.canvas.set_state('Idle'); self.say('番茄钟已停止')
     def _timer_text(self)->None: self.timer_window.label.setText(f'{self.remaining//60:02d}:{self.remaining%60:02d}')
     def _tick(self)->None:
         self.remaining-=1; self._timer_text()
-        if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.say('专注完成！',5000)
+        if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.canvas.set_state('Idle'); self.say('专注完成！',5000)
     def _wander(self)->None:
         if load_settings()['motion']['mode']!='movable' or self.drag or random.random()>.28:return
-        self.canvas.act(); area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-70,70))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-35,35)))); self.animation=QPropertyAnimation(self,b'pos',self); self.animation.setDuration(650); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
-    def say(self,text:str,duration:int=2300)->None: self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide)
+        area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-70,70))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-35,35)))); self.canvas.set_state('Move', mirrored=target.x()<self.x()); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
+    def say(self,text:str,duration:int=2300)->None:
+        self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide); self.canvas.show_temporary('Talk',duration)
 
 
 
