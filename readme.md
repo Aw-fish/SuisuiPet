@@ -31,7 +31,7 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 > `character.json` 整体排除在版本控制之外。示例角色 `default` 只跟踪立绘，
 > 它的配置文件在首次运行时会按代码里的默认值自动生成。
 
-## MVP 功能范围与实现进度（截至 2026-09-12）
+## MVP 功能范围与实现进度（截至 2026-09-13）
 
 ### 1. 桌宠角色
 
@@ -54,8 +54,9 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 - ✅ 生成中桌宠自动切到说话动作，结束后回到基础状态。
 - ✅ 输入框支持 `Enter` 发送、`Shift+Enter` 换行；出错时显示可直接读懂的提示。
 - ✅ 每个角色独立配置 `API 地址 / 模型名称 / 温度 / 上下文轮数 / 角色提示词`，并带「测试连接」。
-- ✅ API Key 只从环境变量读取，配置文件不落 Key。
-- ✅ **记忆**：会话日志 + 长期记忆摘要，重启后恢复最近对话。
+- ✅ API Key 随角色配置保存在 `character.json`，靠 `.gitignore` 排除（见「配置 API Key」）。
+- ✅ **记忆数据层与检索**：记忆条目分事实 / 偏好 / 事件 / 约定四类，带时间、重要度与动态权重；自建二元组切分 + FTS5 BM25 检索，别名表补同义表达，排序分 = 相关性 × 重要度 × 新鲜度，权重按 45 天半衰期衰减并自动归档。
+- ⬜ **记忆的自动整理尚未实现**：退出时总结抽取、启动补做、记忆管理界面都还没接，所以目前记忆库只会被读取，不会自动写入。
 - ⬜ 工具调用（天气 / 时间 / 窗口视觉）尚未实现，接口已留好。
 - ⬜ 语音尚未实现，输出管线已预留句级切分信号。
 
@@ -70,8 +71,8 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 
 - ✅ 系统托盘常驻图标，右键菜单可打开设置 / 退出。
 - ✅ 设置面板（900×740，无边框三页）：
-  - **角色设置**：角色选择 + 添加 / 导入 / 删除角色（可断开连接或删除数据）、角色模型格式（img / live2d）、模型文件位置、AI 模型名称、API Key、角色提示词、移动频率；
-  - **模式设置**：动作模式、对话模式（显示浮动对话框 / 隐藏对话窗口）；
+  - **角色设置**：角色选择 + 添加 / 导入 / 删除角色（可断开连接或删除数据）、角色模型格式（img / live2d）、模型文件位置、移动频率、AI 模型名称、API 地址、代理、API Key、温度与上下文轮数、角色提示词、测试连接；
+  - **模式设置**：动作模式、对话模式（显示浮动对话框 / 隐藏对话窗口）、基础提示词（对所有角色生效的说话风格约束，可一键恢复默认）；
   - **工具**：番茄钟时长、天气城市。
 - ✅ 设置持久化到 `data/settings.json`，旧格式自动迁移。
 - ⬜ 托盘图标未连接单击/双击事件，目前只能通过右键菜单进入设置。
@@ -90,6 +91,7 @@ SuisuiPet/
 │   ├── conversation/
 │   │   ├── service.py               # 对话编排（QThread 流式 + 打断 + 记忆落盘）
 │   │   ├── memory.py                # L1 上下文 / L2 会话日志 / L3 长期记忆
+│   │   ├── retrieval.py             # 记忆检索：二元组切分 + FTS5 BM25
 │   │   ├── message.py               # 消息结构与落盘格式
 │   │   ├── sentence.py              # 句级切分（语音 TTS 的接入点）
 │   │   └── providers/
@@ -107,7 +109,7 @@ SuisuiPet/
 ├── data/
 │   ├── settings.json                # 全局设置 + 角色注册表（不进版本控制）
 │   ├── icon.png / icon.ico          # 应用与托盘图标（由 tools/make_icon.py 生成）
-│   ├── img/Default.png              # 源立绘，仅作为生成脚本的输入
+│   ├── img/Default.png              # 源立绘，仅作为生成脚本的输入（也可用 --source 指定其它路径）
 │   └── characters/<角色名>/
 │       ├── character.json           # 该角色的全部配置（含 API Key，不进版本控制）
 │       ├── sprites/                 # img 格式立绘（示例角色会被跟踪）
@@ -166,12 +168,13 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 ```json
 {
   "character": { "selected": "Suisui", "registered": ["Suisui"] },
-  "conversation": { "show_floating_dialog": false },
+  "conversation": { "show_floating_dialog": false, "base_prompt": "……" },
   "motion": { "mode": "stationary" },
   "tools": { "pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": true }
 }
 ```
 
+- `conversation.base_prompt`：**与角色无关**的通用说话约束（口语化、限制长度、纯文本、不分段等），组装 system 时拼在角色提示词**前面**。在「设置 → 模式设置」里编辑，清空会自动还原默认值。
 - `motion.mode`：`movable` 自由移动 / `stationary` 固定位置。
 - `registered` 是已挂载的角色名列表；文件夹不存在的条目会在加载时自动剔除。
 - 旧版把角色配置内嵌在 `settings.json` 里的结构，会在首次加载时自动拆分到角色目录。
@@ -210,15 +213,20 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 
 ```
 memory/
-├── profile.json      # L3 长期记忆：稳定事实与偏好，会渲染进 system prompt
-├── summary.md        # L3 早期对话摘要
-└── sessions/
-    └── 2026-09-12_2110.jsonl   # L2 会话日志，一行一条消息
+├── sessions/2026-09-12_2110.jsonl   # L2 会话日志，一行一条消息（保留原文）
+├── memories.jsonl                   # L3 长期记忆的唯一事实来源
+├── archive.jsonl                    # 权重衰减后归档的记忆（移出检索池但不删除）
+├── summaries/2026-09.md             # L3 滚动摘要，按月归档
+├── pending.json                     # 尚未整理的会话清单（整理流程的幂等依据）
+├── aliases.json                     # 别名表（上海/沪/魔都），缓解换说法漏召回
+└── memory.db                        # memories.jsonl 的 FTS5 索引，可随时重建
 ```
 
-- **L1 工作上下文**：每次请求组装 `人设 → 长期记忆 → 摘要 → 最近 N 轮`，N 由 `max_context_messages` 决定。
-- **L2 会话日志**：逐条追加写 jsonl，崩溃不丢；被打断的回复带 `"interrupted": true`。
-- **L3 长期记忆**：`MemoryStore.remember()` 写入 `profile.json`；`recall()` 目前是关键词匹配，接口预留将来替换成向量检索。
+- **L1 工作上下文**：每次请求组装 `基础提示词 + 角色提示词 + 长期记忆 + 相关记忆 + 摘要 + 最近 N 轮`，N 由 `max_context_messages` 决定。
+- **L2 会话日志**：逐条追加写 jsonl，崩溃不丢；被打断的回复带 `"interrupted": true`。**默认不删除**，用于回查原文与将来重放提炼。
+- **L3 长期记忆**：`memories.jsonl` 是唯一事实来源。每条记忆带 `kind`（事实 / 偏好 / 事件 / 约定）、`importance`（1–5）、`weight`（动态权重）与 `ts` / `last_used`；`memory.db` 只是它的 FTS5 索引，删掉即可由 jsonl 重建。
+- **检索**：自建二元组切分 + FTS5 BM25，排序分 = 相关性 × 重要度 × 新鲜度，并用 `aliases.json` 做同义扩展。
+- **遗忘**：`weight` 按 **45 天半衰期**衰减，低于阈值且重要度 < 4 的记忆自动移入 `archive.jsonl`。
 - `memory/` 已在 `.gitignore` 中忽略，不会进仓库。
 
 ### 角色管理
@@ -253,7 +261,8 @@ memory/
 ## 后续可迭代方向
 
 - 更丰富的动作、表情、音效和角色资源包。
-- 对话记忆、人格配置与语音交互。
+- 记忆的**自动整理**（退出时总结抽取、启动补做）与**记忆管理界面**——数据层与检索层已就绪，只差这两块。
+- 人格配置与语音交互。
 - 日程、待办和更多桌面效率工具。
 - 角色行为的时间、天气或专注状态联动。
 - 工程化补齐：`requirements.txt`、打包发布（PyInstaller）、测试与 CI。

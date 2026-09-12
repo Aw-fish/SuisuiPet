@@ -12,3 +12,6 @@ data/characters/*
 data/characters/*/memory/
 # 角色配置里有 API Key，同样不跟踪（gitignore 只能忽略整个文件，不能只忽略某个字段）
 data/characters/*/character.json
+
+# 记忆系统的设计笔记，保留在本地，不随仓库同步
+memory.md

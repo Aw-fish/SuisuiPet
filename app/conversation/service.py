@@ -176,7 +176,8 @@ class ConversationService(QObject):
             self.failed.emit("没有配置 API 地址或模型名称，请到设置 → 角色设置里填写")
             return
         self._memory.append(Message(role=ROLE_USER, content=text))
-        messages = self._memory.build_context(self._system_prompt(), self._context_limit())
+        # 把用户这句话交给记忆检索，召回与当前话题相关的长期记忆
+        messages = self._memory.build_context(self._system_prompt(), self._context_limit(), text)
         self._splitter.reset()
         worker = _StreamWorker(provider, messages, self)
         worker.delta.connect(self._on_delta)
