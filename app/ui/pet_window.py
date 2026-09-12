@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 from typing import Callable
-from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QRect, QSize, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 from app import characters
@@ -23,8 +23,17 @@ BUBBLE_HEIGHT = 34
 DEFAULT_CANVAS_SIZE = QSize(168, 168)
 #: 打开对话窗时最多恢复多少条历史
 HISTORY_LIMIT = 30
-#: 单个气泡的最大宽度
-MAX_BUBBLE_WIDTH = 300
+#: 对话窗尺寸（竖长比例，贴近手机聊天界面）
+CHAT_SIZE = QSize(400, 600)
+#: 单个气泡最多占消息区宽度的比例
+BUBBLE_MAX_RATIO = 0.9
+#: 气泡左右内边距 + 边框，与 CHAT_QSS 里的 padding 保持一致
+BUBBLE_PADDING = 26
+#: 宽度测量余量。实测 QLabel 的换行判定比 QFontMetrics 的度量值多吃约 6px：
+#: 按"度量值恰好相等"给宽度，短消息会被白白折成两行。这里留 8px 富余。
+BUBBLE_SLACK = 8
+#: 单条气泡的最小宽度
+BUBBLE_MIN_WIDTH = 52
 
 ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
 
@@ -111,27 +120,39 @@ class ChatDialog(QDialog):
         self._stream_label: QLabel | None = None
         self._buffer = ""
         self._follow = True
+        #: 标记"当前这次滚动是程序发起的"，避免误判成用户手动滚动
+        self._auto_scrolling = False
         self._reset_timer = QTimer(self)
         self._reset_timer.setInterval(40)
         self._reset_timer.timeout.connect(self._flush_stream)
 
-        self.setFixedSize(390, 480)
+        self.setFixedSize(CHAT_SIZE)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         root = QFrame(objectName="chatRoot")
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(root)
-        layout = QVBoxLayout(root); layout.setContentsMargins(16, 10, 16, 16); layout.setSpacing(8)
-        self.drag_bar = QFrame(objectName="dragBar"); self.drag_bar.setFixedHeight(28); self.drag_bar.setCursor(Qt.OpenHandCursor); self.drag_bar.installEventFilter(self)
-        bar = QHBoxLayout(self.drag_bar); bar.setContentsMargins(0, 0, 0, 0)
-        self.title = QLabel("对话", objectName="chatTitle"); bar.addWidget(self.title); bar.addStretch()
-        close = QPushButton("×", objectName="chatClose"); close.clicked.connect(self.hide); bar.addWidget(close); layout.addWidget(self.drag_bar)
+        layout = QVBoxLayout(root); layout.setContentsMargins(12, 8, 12, 12); layout.setSpacing(8)
+        # 顶栏做成聊天软件的两行表头：角色名 + 状态，标题居中，关闭键在右
+        self.drag_bar = QFrame(objectName="dragBar"); self.drag_bar.setFixedHeight(46); self.drag_bar.setCursor(Qt.OpenHandCursor); self.drag_bar.installEventFilter(self)
+        bar = QHBoxLayout(self.drag_bar); bar.setContentsMargins(0, 0, 0, 0); bar.setSpacing(6)
+        bar.addSpacing(26)
+        bar.addStretch()
+        head = QVBoxLayout(); head.setSpacing(0); head.setContentsMargins(0, 0, 0, 0)
+        self.title = QLabel("对话", objectName="chatTitle"); self.title.setAlignment(Qt.AlignCenter)
+        self.status = QLabel("", objectName="chatStatus"); self.status.setAlignment(Qt.AlignCenter)
+        head.addWidget(self.title); head.addWidget(self.status)
+        bar.addLayout(head)
+        bar.addStretch()
+        close = QPushButton("×", objectName="chatClose"); close.clicked.connect(self.hide); bar.addWidget(close)
+        layout.addWidget(self.drag_bar)
+        line = QFrame(objectName="chatLine"); line.setFixedHeight(1); layout.addWidget(line)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
-        self.messages = QWidget(); self.history = QVBoxLayout(self.messages); self.history.setContentsMargins(2, 2, 2, 2); self.history.addStretch(); self.scroll.setWidget(self.messages); layout.addWidget(self.scroll, 1)
-        self.status = QLabel("", objectName="chatStatus"); layout.addWidget(self.status)
+        self.scroll.verticalScrollBar().rangeChanged.connect(self._on_range_changed)
+        self.messages = QWidget(); self.history = QVBoxLayout(self.messages); self.history.setContentsMargins(2, 6, 2, 2); self.history.setSpacing(10); self.history.addStretch(); self.scroll.setWidget(self.messages); layout.addWidget(self.scroll, 1)
         row = QHBoxLayout(); row.setSpacing(8)
-        self.input = ChatInput(objectName="chatInput"); self.input.setPlaceholderText("说点什么……（Enter 发送，Shift+Enter 换行）"); self.input.setFixedHeight(40)
+        self.input = ChatInput(objectName="chatInput"); self.input.setPlaceholderText("说点什么……（Enter 发送，Shift+Enter 换行）"); self.input.setFixedHeight(44)
         self.input.submitted.connect(self._on_button)
         self.send_button = QPushButton("发送", objectName="send"); self.send_button.clicked.connect(self._on_button)
         row.addWidget(self.input, 1); row.addWidget(self.send_button); layout.addLayout(row)
@@ -143,24 +164,43 @@ class ChatDialog(QDialog):
 
     # ---- 消息渲染 -----------------------------------------------------------
 
-    @staticmethod
-    def _fit_width(label: QLabel, text: str) -> int:
+    def _message_area_width(self) -> int:
+        """消息区可用宽度：窗口宽 - 外边距 - 滚动条。"""
+        margins = 12 * 2 + 2 * 2
+        return max(160, self.width() - margins - 10)
+
+    def _bubble_width(self, label: QLabel, text: str) -> int:
+        """气泡宽度 = min(整条文本的单行宽度, 限宽)。
+
+        这里用 ``horizontalAdvance`` 量"一行到底"需要多宽：放得下就绝不被折行，
+        放不下才交给 QLabel 在限宽内换行。早先用 ``boundingRect`` + TextWordWrap
+        量，它会在临界点上提前折行，导致本来一行能放下的消息也被切成两行。
+        """
+        limit = max(BUBBLE_MIN_WIDTH, int(self._message_area_width() * BUBBLE_MAX_RATIO))
         metrics = QFontMetrics(label.font())
-        rect = metrics.boundingRect(QRect(0, 0, MAX_BUBBLE_WIDTH, 0), Qt.TextWordWrap, text or " ")
-        return max(72, min(MAX_BUBBLE_WIDTH, rect.width() + 26))
+        natural = metrics.horizontalAdvance(text or " ") + BUBBLE_PADDING + BUBBLE_SLACK
+        return max(BUBBLE_MIN_WIDTH, min(limit, natural))
 
     def add(self, text: str, user: bool) -> QLabel:
         label = QLabel(text, objectName="userMsg" if user else "petMsg")
         label.setWordWrap(True)
-        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setFixedWidth(self._fit_width(label, text))
-        row = QHBoxLayout()
+        # 固定宽度 + heightForWidth，保证自动换行后高度算得准
+        policy = QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
+        policy.setHeightForWidth(True)
+        label.setSizePolicy(policy)
+        label.setFixedWidth(self._bubble_width(label, text))
+        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
         if user: row.addStretch(); row.addWidget(label)
         else: row.addWidget(label); row.addStretch()
         self.history.insertLayout(self.history.count() - 1, row)
-        self._scroll_to_bottom()
+        # 新增一条消息属于"必须置底"的场景（包括自己刚发出的那条）
+        self._scroll_to_bottom(force=True)
         return label
+
+    def set_title(self, name: str) -> None:
+        """标题显示角色名，像聊天窗口里的对方昵称。"""
+        self.title.setText(name.strip() or "对话")
 
     def clear(self) -> None:
         self._stream_label = None
@@ -197,14 +237,40 @@ class ChatDialog(QDialog):
     # ---- 滚动跟随 -----------------------------------------------------------
 
     def _on_scrolled(self, value: int) -> None:
+        # 只把"用户自己拖动滚动条"当成意图；程序触发的滚动不能反过来关掉跟随
+        if self._auto_scrolling:
+            return
         bar = self.scroll.verticalScrollBar()
         self._follow = value >= bar.maximum() - 8
 
-    def _scroll_to_bottom(self) -> None:
+    def _on_range_changed(self, _minimum: int, maximum: int) -> None:
+        """内容变高（折行变多、追加文字）时仍然钉在底部。
+
+        QLabel 重新排版是异步的：置底时滚动条最大值还是旧的，等布局完成内容
+        已经长出去了，所以必须在范围变化时再补一次。
+        """
+        if self._follow:
+            self._apply_bottom()
+
+    def _apply_bottom(self) -> None:
+        bar = self.scroll.verticalScrollBar()
+        self._auto_scrolling = True
+        bar.setValue(bar.maximum())
+        self._auto_scrolling = False
+
+    def _scroll_to_bottom(self, force: bool = False) -> None:
+        """跟随最后一条消息；``force`` 用于"发了消息 / 来了新回复"必须置底的场景。"""
+        if force:
+            self._follow = True
         if not self._follow:
             return
-        bar = self.scroll.verticalScrollBar()
-        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+        self._apply_bottom()
+        # 布局要等这一轮事件处理完才更新，届时要再钉一次
+        QTimer.singleShot(0, self._deferred_bottom)
+
+    def _deferred_bottom(self) -> None:
+        if self._follow:
+            self._apply_bottom()
 
     # ---- 发送 / 打断 --------------------------------------------------------
 
@@ -218,7 +284,7 @@ class ChatDialog(QDialog):
             return
         self.input.clear()
         self.add(text, True)
-        self.status.setText("正在思考…")
+        self.status.setText("正在输入…")
         self.conversation.send(text)
 
     def _on_busy_changed(self, busy: bool) -> None:
@@ -229,17 +295,12 @@ class ChatDialog(QDialog):
         if busy:
             self._buffer = ""
             self._stream_label = self.add("", False)
-            self.status.setText("生成中…")
+            self.status.setText("正在输入…")
             self._reset_timer.start()
         else:
+            # 注意：这里不能清 _stream_label。服务是「先 busy_changed(False)、
+            # 后 finished(全文)」，提前清掉会让收尾的全文无处可写，回复尾部丢失。
             self._reset_timer.stop()
-            self._end_stream_bubble()
-
-    def _end_stream_bubble(self) -> None:
-        label = self._stream_label
-        self._stream_label = None
-        if label is not None and not label.text():
-            label.setText("（没有内容）")
 
     def _on_delta(self, text: str) -> None:
         self._buffer += text
@@ -252,16 +313,28 @@ class ChatDialog(QDialog):
         if label.text() == text:
             return
         label.setText(text)
-        label.setFixedWidth(self._fit_width(label, text))
+        label.setFixedWidth(self._bubble_width(label, text))
         self._scroll_to_bottom()
 
     def _on_finished(self, text: str) -> None:
         self._reset_timer.stop()
-        if self._stream_label is not None:
-            self._buffer = text
-            self._flush_stream()
-            self._stream_label = None
+        label = self._stream_label
+        self._stream_label = None
+        if label is not None:
+            # 流式刷新是 40ms 抽帧，最后一批增量可能还没画上去，
+            # 这里用完整文本无条件收尾，保证回复一个字符都不少。
+            final = text.strip() or self._buffer.strip()
+            if final:
+                self._buffer = final
+                if label.text() != final:
+                    label.setText(final)
+                label.setFixedWidth(self._bubble_width(label, final))
+            elif not label.text():
+                label.setText("（没有内容）")
+                label.setFixedWidth(self._bubble_width(label, label.text()))
         self.status.setText("")
+        # 一条完整回复落地，等同于来了一条新消息，直接跳到底部
+        self._scroll_to_bottom(force=True)
 
     def _on_failed(self, message: str) -> None:
         self._reset_timer.stop()
@@ -270,10 +343,11 @@ class ChatDialog(QDialog):
         text = f"出错：{message}"
         if label is not None and not label.text():
             label.setText(text)
-            label.setFixedWidth(self._fit_width(label, text))
+            label.setFixedWidth(self._bubble_width(label, text))
         else:
             self.add(text, False)
         self.status.setText("")
+        self._scroll_to_bottom(force=True)
 
     # ---- 窗口 ---------------------------------------------------------------
 
@@ -288,15 +362,20 @@ class ChatDialog(QDialog):
         return super().eventFilter(watched, event)
 
     def show_near(self, pet: QWidget) -> None:
-        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 30, 190)
-        self.move(max(area.left() + 8, point.x()), max(area.top() + 8, point.y())); self.show(); self.raise_(); self.activateWindow()
+        """贴在桌宠左侧显示；窗口变高后可能顶出屏幕，这里统一收进可用区域。"""
+        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 24, 150)
+        x = max(area.left() + 8, min(point.x(), area.right() - self.width() - 8))
+        y = max(area.top() + 8, min(point.y(), area.bottom() - self.height() - 8))
+        self.move(x, y); self.show(); self.raise_(); self.activateWindow()
 
 
 CHAT_QSS = (
     'QDialog { background: transparent; }'
-    'QFrame#chatRoot { background:#FFFFFF; border:1px solid #EAE6F2; border-radius:16px; }'
-    'QLabel#chatTitle { color:#5C5275; font:600 11px "Microsoft YaHei UI"; }'
-    'QLabel#chatStatus { color:#A39CAD; font:10px "Microsoft YaHei UI"; padding-left:2px; }'
+    'QFrame#chatRoot { background:#FFFFFF; border:1px solid #EAE6F2; border-radius:18px; }'
+    'QFrame#dragBar { background:transparent; }'
+    'QFrame#chatLine { background:#F1EEF8; }'
+    'QLabel#chatTitle { color:#3F3953; font:600 13px "Microsoft YaHei UI"; }'
+    'QLabel#chatStatus { color:#A9A3B6; font:10px "Microsoft YaHei UI"; }'
     'QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }'
     'QScrollBar:vertical { background:transparent; width:8px; margin:0; }'
     'QScrollBar::handle:vertical { background:#DFDAEC; border-radius:4px; min-height:28px; }'
@@ -311,8 +390,8 @@ CHAT_QSS = (
     'QPushButton#stop:hover { background:#E8E2F5; }'
     'QPushButton#chatClose { border:0; background:transparent; color:#A39CAD; font-size:17px; min-width:24px; max-width:24px; }'
     'QPushButton#chatClose:hover { color:#685D78; background:#F4F1FA; border-radius:8px; }'
-    'QLabel#petMsg { background:#F7F5FB; color:#4C4759; border-radius:12px; padding:9px 12px; }'
-    'QLabel#userMsg { background:#EEEAFE; color:#51457B; border-radius:12px; padding:9px 12px; }'
+    'QLabel#petMsg { background:#F6F4FB; color:#4C4759; border-radius:14px; padding:10px 13px; }'
+    'QLabel#userMsg { background:#ECE7FE; color:#51457B; border-radius:14px; padding:10px 13px; }'
 )
 
 
@@ -410,7 +489,8 @@ class PetWindow(QWidget):
         if not self.wander.isActive(): self.wander.start()
         self.canvas.set_assets(assets); self._sync_geometry()
         name, info = current_character(data)
-        self.conversation.configure(name, info)
+        self.conversation.configure(name, info, data.get("conversation", {}).get("base_prompt", ""))
+        self.chat.set_title(name)
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
     def _on_conversation_busy(self, busy: bool) -> None:
         if busy: self.canvas.set_state('Talk')

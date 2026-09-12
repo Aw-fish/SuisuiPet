@@ -119,15 +119,21 @@ class ConversationService(QObject):
         super().__init__(parent)
         self._character = ""
         self._info: dict = {}
+        self._base_prompt = ""
         self._memory: MemoryStore | None = None
         self._worker: _StreamWorker | None = None
         self._splitter = SentenceSplitter()
 
     # ---- 配置 ---------------------------------------------------------------
 
-    def configure(self, character: str, info: dict) -> None:
-        """切换当前角色：换角色同时切换记忆目录。"""
+    def configure(self, character: str, info: dict, base_prompt: str = "") -> None:
+        """切换当前角色：换角色同时切换记忆目录。
+
+        ``base_prompt`` 是与角色无关的通用说话约束（全局设置），发请求时拼在
+        角色提示词前面。
+        """
         self._info = dict(info or {})
+        self._base_prompt = base_prompt or ""
         if character != self._character:
             self._character = character
             self._memory = MemoryStore(character) if character else None
@@ -216,7 +222,12 @@ class ConversationService(QObject):
             self.finished.emit(text)
 
     def _system_prompt(self) -> str:
-        return str(self._info.get("system_prompt", ""))
+        """通用的说话约束在前，角色自己的设定在后，两者拼成一条 system。"""
+        parts = [
+            str(self._base_prompt).strip(),
+            str(self._info.get("system_prompt", "")).strip(),
+        ]
+        return "\n\n".join(part for part in parts if part)
 
     def _context_limit(self) -> int:
         try:

@@ -16,9 +16,21 @@ from typing import Any
 from app import characters
 from app.paths import SETTINGS_PATH
 
+#: 与角色无关的通用说话约束。组装 system 消息时拼在角色提示词前面，
+#: 让所有角色都"像在聊天"，而不是写小作文（见 ConversationService._system_prompt）。
+BASE_SYSTEM_PROMPT = (
+    "你在用即时通讯工具和用户聊天，请像真人发消息一样回复：\n"
+    "1. 用口语化的短句，不要写成客服话术或说明书；\n"
+    "2. 每次回复控制在 1~3 句、大约 60 字以内，不要长篇大论；\n"
+    "3. 只输出纯文本，不要使用 Markdown 语法（#、*、-、反引号、表格、代码块等）；\n"
+    "4. 不要分段、不要列清单、不要加小标题，整条回复连成一段；\n"
+    "5. 不要复述或总结用户的话，直接回应；\n"
+    "6. 不知道就直说不知道，不要编造事实。"
+)
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "character": {"selected": "Suisui", "registered": ["Suisui"]},
-    "conversation": {"show_floating_dialog": False},
+    "conversation": {"show_floating_dialog": False, "base_prompt": BASE_SYSTEM_PROMPT},
     "motion": {"mode": "stationary"},
     "tools": {"pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": True},
 }

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QEasingCurve, QObject, QPoint, QPropertyAnimation, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 
 from PySide6.QtWidgets import (
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
 )
 from app import characters
-from app.config import load_settings, save_settings
+from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.conversation.service import check_connection
 from app.ui.dialogs import StyledDialog
 from app.ui.icons import app_icon
@@ -35,6 +35,16 @@ class _ConnectWorker(QThread):
         except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
             ok, message = False, f"测试失败：{exc}"
         self.done.emit(ok, message)
+
+
+class _WheelGuard(QObject):
+    """屏蔽滚轮事件：鼠标划过数值控件时不要改动数值，太容易误触。"""
+
+    def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
+        if event.type() == QEvent.Type.Wheel:
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
 
 
 class ComboBox(QComboBox):
@@ -73,6 +83,8 @@ class SettingsWindow(QMainWindow):
         self._active_character: str | None = None
         self._character_cache: dict[str, dict] = {}
         self._test_worker: _ConnectWorker | None = None
+        # 拦截器必须被持有，否则会被 Python 回收导致失效
+        self._wheel_guards: list[_WheelGuard] = []
         self.setWindowTitle("SuisuiPet")
         self.setFixedSize(900, 740)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.NoDropShadowWindowHint)
@@ -129,7 +141,15 @@ class SettingsWindow(QMainWindow):
         content_layout.addWidget(save, alignment=Qt.AlignRight)
         shell.addWidget(sidebar)
         shell.addWidget(content, 1)
+        # 数值控件一律不吃滚轮，避免滚动页面时误改设置
+        self._block_wheel(self.temperature, self.context_limit, self.activity, self.pomodoro)
         self.setStyleSheet(self._qss())
+
+    def _block_wheel(self, *widgets: QWidget) -> None:
+        guard = _WheelGuard(self)
+        self._wheel_guards.append(guard)
+        for widget in widgets:
+            widget.installEventFilter(guard)
 
     def _page(self, title: str, description: str) -> tuple[QWidget, QVBoxLayout]:
         """标题固定在顶部，字段区域可滚动，避免以后加设置项时被挤扁。"""
@@ -272,7 +292,7 @@ class SettingsWindow(QMainWindow):
         self.activity_value.setText(f"{value} / 10")
 
     def _mode_page(self) -> QWidget:
-        page, layout = self._page("模式设置", "分别控制角色在桌面上的行为和对话入口。")
+        page, layout = self._page("模式设置", "分别控制角色在桌面上的行为、对话入口与全局对话风格。")
         layout.addWidget(self._label("角色动作模式"))
         self.movable, self.stationary = QRadioButton("自由移动"), QRadioButton("固定位置")
         self.motion_group = QButtonGroup(self)
@@ -286,8 +306,27 @@ class SettingsWindow(QMainWindow):
         self.dialog_group.addButton(self.floating); self.dialog_group.addButton(self.hidden)
         layout.addWidget(self.floating); layout.addWidget(self.hidden)
         layout.addWidget(QLabel("隐藏后仍可从任务栏角标或角色交互中调出。", objectName="hint"))
+        layout.addSpacing(20)
+        layout.addWidget(self._label("基础提示词（对所有角色生效）"))
+        self.base_prompt = QTextEdit()
+        self.base_prompt.setFixedHeight(146)
+        self.base_prompt.setPlaceholderText("约束整体说话风格，例如回复长度、语气与格式……")
+        layout.addWidget(self.base_prompt)
+        prompt_row = QHBoxLayout()
+        prompt_row.setSpacing(10)
+        self.reset_prompt = QPushButton("恢复默认", objectName="mini")
+        self.reset_prompt.setToolTip("还原成内置的聊天风格提示词")
+        self.reset_prompt.clicked.connect(self._reset_base_prompt)
+        prompt_row.addWidget(self.reset_prompt)
+        prompt_row.addWidget(
+            QLabel("会拼在「角色设置 → 角色提示词」前面一起发给模型。", objectName="hint"), 1
+        )
+        layout.addLayout(prompt_row)
         layout.addStretch()
         return page
+
+    def _reset_base_prompt(self) -> None:
+        self.base_prompt.setPlainText(BASE_SYSTEM_PROMPT)
 
     def _tools_page(self) -> QWidget:
         page, layout = self._page("工具", "设置桌宠提供的轻量日常工具。")
@@ -533,6 +572,7 @@ class SettingsWindow(QMainWindow):
         self.movable.setChecked(self.data["motion"]["mode"] == "movable")
         self.stationary.setChecked(not self.movable.isChecked())
         self.floating.setChecked(a["show_floating_dialog"]); self.hidden.setChecked(not self.floating.isChecked())
+        self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
 
     def save(self) -> None:
@@ -543,6 +583,8 @@ class SettingsWindow(QMainWindow):
         self.data["character"]["selected"] = name
         self.data["conversation"].pop("api_url", None)
         self.data["conversation"]["show_floating_dialog"] = self.floating.isChecked()
+        # 清空就还原默认，避免不小心把通用约束删没了
+        self.data["conversation"]["base_prompt"] = self.base_prompt.toPlainText().strip() or BASE_SYSTEM_PROMPT
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
         self._flush_characters()
