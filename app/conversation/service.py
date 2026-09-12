@@ -45,6 +45,7 @@ def build_provider(info: dict) -> LLMProvider | None:
         api_key=str(info.get("api_key", "")).strip(),
         temperature=_as_float(info.get("temperature"), DEFAULT_TEMPERATURE),
         timeout=int(_as_float(info.get("timeout"), DEFAULT_TIMEOUT)),
+        proxy=str(info.get("proxy", "")).strip(),
     )
 
 

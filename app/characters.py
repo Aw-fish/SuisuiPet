@@ -37,6 +37,7 @@ DEFAULT_CHARACTER: dict[str, Any] = {
     "model": "deepseek-chat",
     "base_url": "https://api.deepseek.com/v1",
     "api_key": "",
+    "proxy": "",
     "temperature": 0.8,
     "max_context_messages": 20,
     "system_prompt": "",

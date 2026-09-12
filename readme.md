@@ -9,7 +9,7 @@ pip install PySide6 Pillow requests
 python main.py
 ```
 
-- 需要 Python 3.10+（代码使用了 `dict[str, Any]`、`X | None` 等写法）。
+- 需要 Python 3.9+（代码使用 `dict[str, Any]`、`X | None` 这类写法，靠 `from __future__ import annotations` 兼容 3.9）。
 - 桌宠默认出现在屏幕右下角，**右键角色**可打开功能菜单；托盘图标右键可打开设置。
 - `Pillow` 只用于生成占位素材与图标的脚本，运行应用本身不需要。
 
@@ -189,6 +189,7 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
   "model": "deepseek-chat",
   "base_url": "https://api.deepseek.com/v1",
   "api_key": "",
+  "proxy": "",
   "temperature": 0.8,
   "max_context_messages": 20,
   "system_prompt": "",
@@ -199,8 +200,9 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 - `format`：`img`（立绘文件夹）/ `live2d`（模型 JSON）。
 - `asset`：img 格式的立绘目录，默认是角色目录下的 `sprites`。
 - `asset_path`：仅 live2d 使用，指向模型文件。
-- `base_url` / `model` / `api_key` / `temperature` / `max_context_messages` / `system_prompt`：对话参数，按角色独立保存。
+- `base_url` / `model` / `api_key` / `proxy` / `temperature` / `max_context_messages` / `system_prompt`：对话参数，按角色独立保存。
 - `api_key`：只在本机使用，靠 `.gitignore` 排除，不会上传。
+- `proxy`：留空表示**直连并忽略系统代理**（默认）。Windows 上 `requests` 会自动读取注册表里的 WinINET 代理，那通常是为别的用途配的，会导致接口连接失败；需要走代理时在这里显式填写，例如 `http://127.0.0.1:7890`。
 - `activity`：1–10，数值越大则随机动作越频繁、移动距离越远（等级 1 约 9.0s / 3% / ±30px，等级 10 约 2.7s / 52.5% / ±138px）。
 - 角色设置页改的就是当前选中角色的这份配置，**点「保存设置」后写入**。
 
@@ -237,7 +239,7 @@ memory/
 | 托盘右键 | 打开设置 / 退出 |
 | 对话窗输入框 | `Enter` 发送，`Shift+Enter` 换行 |
 | 对话窗「停止」 | 随时打断生成，已生成内容保留 |
-| 角色设置「测试连接」 | 发一条极短请求，把鉴权 / 地址 / 模型名的报错直接显示出来 |
+| 角色设置「测试连接」 | 发一条极短请求，把鉴权 / 地址 / 模型名 / 代理的报错直接显示出来 |
 
 ## 开发约定
 

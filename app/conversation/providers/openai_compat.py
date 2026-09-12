@@ -36,14 +36,30 @@ class OpenAICompatProvider:
         api_key: str = "",
         temperature: float = 0.8,
         timeout: int = 60,
+        proxy: str = "",
     ) -> None:
         self.base_url = (base_url or "").strip().rstrip("/")
         self.model = (model or "").strip()
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        self.proxy = (proxy or "").strip()
         self._response: requests.Response | None = None
         self._lock = threading.Lock()
+        self._session = self._build_session()
+
+    def _build_session(self) -> requests.Session:
+        """默认忽略系统 / 环境变量代理。
+
+        Windows 上 ``requests`` 会自动读取注册表里的 WinINET 代理设置，那通常是
+        为别的用途配的（实测会让国内直连的接口报 SSLEOFError）。需要代理时在
+        角色设置里显式填写。
+        """
+        session = requests.Session()
+        session.trust_env = False
+        if self.proxy:
+            session.proxies = {"http": self.proxy, "https": self.proxy}
+        return session
 
     # ---- 请求构造 -----------------------------------------------------------
 
@@ -84,7 +100,7 @@ class OpenAICompatProvider:
     ) -> Iterator[Chunk]:
         self._validate()
         try:
-            response = requests.post(
+            response = self._session.post(
                 self.endpoint,
                 headers=self._headers(),
                 json=self._payload(messages, tools, True),
@@ -92,7 +108,7 @@ class OpenAICompatProvider:
                 timeout=(CONNECT_TIMEOUT, self.timeout),
             )
         except requests.RequestException as exc:
-            raise ProviderError(f"连接失败：{exc}") from exc
+            raise ProviderError(self._network_error(exc)) from exc
         with self._lock:
             self._response = response
         try:
@@ -115,7 +131,7 @@ class OpenAICompatProvider:
         """发一条最小请求验证地址 / Key / 模型名，成功时返回模型名。"""
         self._validate()
         try:
-            response = requests.post(
+            response = self._session.post(
                 self.endpoint,
                 headers=self._headers(),
                 json={
@@ -127,10 +143,22 @@ class OpenAICompatProvider:
                 timeout=(CONNECT_TIMEOUT, PROBE_TIMEOUT),
             )
         except requests.RequestException as exc:
-            raise ProviderError(f"连接失败：{exc}") from exc
+            raise ProviderError(self._network_error(exc)) from exc
         if response.status_code >= 400:
             raise ProviderError(self._error_text(response))
         return self.model
+
+    @staticmethod
+    def _network_error(exc: Exception) -> str:
+        """把底层网络异常翻译成可操作的提示。"""
+        text = str(exc)
+        if "proxy" in text.lower():
+            return (
+                f"连接失败：{text}\n"
+                "看起来是系统代理在阻断请求。可以在「角色设置 → 代理」里填写正确的代理地址，"
+                "或确认该接口是否可以直连。"
+            )
+        return f"连接失败：{text}"
 
     # ---- SSE 解析 -----------------------------------------------------------
 

@@ -226,6 +226,10 @@ class SettingsWindow(QMainWindow):
         self.base_url = QLineEdit()
         self.base_url.setPlaceholderText("例如：https://api.deepseek.com/v1")
         layout.addWidget(self.base_url)
+        layout.addWidget(self._label("代理（可留空）"))
+        self.proxy = QLineEdit()
+        self.proxy.setPlaceholderText("留空 = 直连并忽略系统代理，例如 http://127.0.0.1:7890")
+        layout.addWidget(self.proxy)
         layout.addWidget(self._label("API Key"))
         self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.Password)
@@ -325,6 +329,7 @@ class SettingsWindow(QMainWindow):
         self._show_asset_target(name, info)
         self.model.setText(str(info.get("model", "")))
         self.base_url.setText(str(info.get("base_url", "")))
+        self.proxy.setText(str(info.get("proxy", "")))
         self.key.setText(str(info.get("api_key", "")))
         try:
             temperature = float(info.get("temperature", 0.8))
@@ -368,6 +373,7 @@ class SettingsWindow(QMainWindow):
             "asset_path": "" if is_img else self.asset_path.text().strip(),
             "model": self.model.text().strip(),
             "base_url": self.base_url.text().strip(),
+            "proxy": self.proxy.text().strip(),
             "api_key": self.key.text().strip(),
             "temperature": round(self.temperature.value(), 1),
             "max_context_messages": self.context_limit.value(),
@@ -383,6 +389,7 @@ class SettingsWindow(QMainWindow):
         info.update({
             "model": self.model.text().strip(),
             "base_url": self.base_url.text().strip(),
+            "proxy": self.proxy.text().strip(),
             "api_key": self.key.text().strip(),
             "temperature": round(self.temperature.value(), 1),
             "max_context_messages": self.context_limit.value(),
