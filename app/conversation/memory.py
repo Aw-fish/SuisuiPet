@@ -191,6 +191,7 @@ class MemoryStore:
         self.root = characters.memory_dir(character)
         self.sessions_dir = self.root / SESSIONS_DIRNAME
         self.session_path = self._latest_session() or self._new_session_path()
+        self._pending_marked: set[str] = set()
 
     # ---- 路径 ---------------------------------------------------------------
 
@@ -250,6 +251,11 @@ class MemoryStore:
 
     def append(self, message: Message) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # 首次写入时把这段会话登记成「待整理」：即使进程崩溃，下次启动也能补做
+        name = self.session_path.name
+        if name not in self._pending_marked:
+            self.mark_pending(name)
+            self._pending_marked.add(name)
         with self.session_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(message.to_record(), ensure_ascii=False) + "\n")
 

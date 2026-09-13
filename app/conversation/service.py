@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from app.conversation.consolidation import consolidate_pending
 from app.conversation.memory import MemoryStore
 from app.conversation.message import Message, ROLE_ASSISTANT, ROLE_USER
 from app.conversation.providers.base import LLMProvider, ProviderError
@@ -108,12 +109,41 @@ class _StreamWorker(QThread):
         self.finished.emit("".join(parts))
 
 
+class _ConsolidationWorker(QThread):
+    """在后台整理记忆：抽取事实 / 偏好 / 事件 / 约定并合并摘要。"""
+
+    done = Signal(int, int)
+    failed = Signal(str)
+
+    def __init__(self, store: MemoryStore, info: dict, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._store = store
+        self._info = dict(info)
+
+    def run(self) -> None:
+        provider = build_provider(self._info)
+        if provider is None:
+            self.failed.emit("没有配置 API 地址或模型名称，无法整理记忆")
+            return
+        try:
+            added, merged = consolidate_pending(self._store, provider)
+        except ProviderError as exc:
+            self.failed.emit(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
+            self.failed.emit(f"整理记忆失败：{exc}")
+            return
+        self.done.emit(added, merged)
+
+
 class ConversationService(QObject):
     delta = Signal(str)
     sentence = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
     busy_changed = Signal(bool)
+    consolidated = Signal(int, int)
+    consolidation_failed = Signal(str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -122,6 +152,7 @@ class ConversationService(QObject):
         self._base_prompt = ""
         self._memory: MemoryStore | None = None
         self._worker: _StreamWorker | None = None
+        self._consolidator: _ConsolidationWorker | None = None
         self._splitter = SentenceSplitter()
 
     # ---- 配置 ---------------------------------------------------------------
@@ -160,6 +191,31 @@ class ConversationService(QObject):
     def start_new_session(self) -> None:
         if self._memory is not None:
             self._memory.new_session()
+
+    @property
+    def consolidating(self) -> bool:
+        return self._consolidator is not None
+
+    def start_consolidation(self) -> None:
+        """后台整理所有待处理会话。幂等，可安全重复调用。"""
+        if self._memory is None or self._consolidator is not None:
+            return
+        worker = _ConsolidationWorker(self._memory, self._info, self)
+        worker.done.connect(self._on_consolidated)
+        worker.failed.connect(self._on_consolidation_failed)
+        worker.finished.connect(self._on_consolidation_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._consolidator = worker
+        worker.start()
+
+    def _on_consolidated(self, added: int, merged: int) -> None:
+        self.consolidated.emit(added, merged)
+
+    def _on_consolidation_failed(self, message: str) -> None:
+        self.consolidation_failed.emit(message)
+
+    def _on_consolidation_finished(self) -> None:
+        self._consolidator = None
 
     def send(self, text: str) -> None:
         text = text.strip()

@@ -465,6 +465,7 @@ class PetWindow(QWidget):
         self._sync_geometry()
         self.animation = QPropertyAnimation(self, b'pos', self); self.animation.setDuration(650); self.animation.finished.connect(self._on_wander_finished)
         self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy)
+        self.conversation.consolidated.connect(self._on_consolidated)
         self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self.load_character(load_settings()); self._place()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
@@ -495,6 +496,11 @@ class PetWindow(QWidget):
     def _on_conversation_busy(self, busy: bool) -> None:
         if busy: self.canvas.set_state('Talk')
         else: self._restore_state()
+    def begin_new_session(self) -> None:
+        """启动时开一段全新会话：历史靠长期记忆承载，对话窗从空开始。"""
+        self.conversation.start_new_session(); self.chat.load_history([])
+    def _on_consolidated(self, added: int, merged: int) -> None:
+        if added > 0: self.say(f'记忆已整理，新增 {added} 条')
     def show_pet(self) -> None:
         """入口调用：有立绘就显示窗口，没有则隐藏并提示一次。"""
         if self.assets is not None:

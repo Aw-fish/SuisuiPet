@@ -19,6 +19,9 @@ def main() -> None:
     settings = SettingsWindow()
     pet = PetWindow(settings.show_from_tray, settings.apply_external_settings)
     settings.settings_saved.connect(pet.apply_settings)
+    # 重启即全新会话：历史由长期记忆承载；同时后台补做上次没整理完的会话
+    pet.begin_new_session()
+    pet.conversation.start_consolidation()
     pet.show_pet()
     sys.exit(app.exec())
 

@@ -127,6 +127,40 @@ class OpenAICompatProvider:
         if response is not None:
             response.close()
 
+    def complete(
+        self,
+        messages: Sequence[dict],
+        max_tokens: int = 800,
+        timeout: int = 40,
+        temperature: float | None = None,
+    ) -> str:
+        """非流式一次拿回完整回复，用于记忆抽取等一次性任务。"""
+        self._validate()
+        payload = self._payload(messages, None, False)
+        payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        try:
+            response = self._session.post(
+                self.endpoint,
+                headers=self._headers(),
+                json=payload,
+                timeout=(CONNECT_TIMEOUT, timeout),
+            )
+        except requests.RequestException as exc:
+            raise ProviderError(self._network_error(exc)) from exc
+        try:
+            if response.status_code >= 400:
+                raise ProviderError(self._error_text(response))
+            body = response.json()
+        finally:
+            response.close()
+        choices = body.get("choices") or []
+        if not choices:
+            raise ProviderError("返回内容为空")
+        message = choices[0].get("message") or {}
+        return str(message.get("content") or "").strip()
+
     def probe(self) -> str:
         """发一条最小请求验证地址 / Key / 模型名，成功时返回模型名。"""
         self._validate()

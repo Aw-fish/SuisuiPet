@@ -43,6 +43,16 @@ class LLMProvider(Protocol):
         """流式产出增量；``cancel`` 置位后应尽快结束。"""
         ...
 
+    def complete(
+        self,
+        messages: Sequence[dict],
+        max_tokens: int = 800,
+        timeout: int = 40,
+        temperature: float | None = None,
+    ) -> str:
+        """非流式一次拿回完整回复，记忆抽取这类一次性任务用。"""
+        ...
+
     def abort(self) -> None:
         """从其它线程强制中断正在进行的请求。"""
         ...
