@@ -192,6 +192,14 @@ class ConversationService(QObject):
         if self._memory is not None:
             self._memory.new_session()
 
+    def reset_memory(self) -> int:
+        """清空当前角色的全部记忆与对话记录，并另起一段新会话。"""
+        if self._memory is None:
+            return 0
+        removed = self._memory.reset()
+        self._memory.new_session()
+        return removed
+
     @property
     def consolidating(self) -> bool:
         return self._consolidator is not None

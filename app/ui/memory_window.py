@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -110,7 +110,10 @@ class MemoryEditDialog(QDialog):
 
 
 class MemoryWindow(QDialog):
-    """角色的长期记忆列表：查看 / 编辑 / 删除 / 手动整理。"""
+    """角色的长期记忆列表：查看 / 编辑 / 删除 / 手动整理 / 全部重置。"""
+
+    #: 记忆被清空后发出，交给主窗口把对话窗与当前会话也翻新
+    reset_requested = Signal()
 
     def __init__(self, parent: QWidget | None, character: str) -> None:
         super().__init__(parent)
@@ -162,6 +165,10 @@ class MemoryWindow(QDialog):
         self.consolidate_button.setToolTip("把还没整理的会话提炼成长期记忆")
         self.consolidate_button.clicked.connect(self._consolidate)
         tools.addWidget(self.consolidate_button)
+        self.reset_button = QPushButton("重置", objectName="dangerMini")
+        self.reset_button.setToolTip("删除全部记忆与对话记录，回到初始状态")
+        self.reset_button.clicked.connect(self._reset)
+        tools.addWidget(self.reset_button)
         layout.addLayout(tools)
 
         self.scroll = QScrollArea()
@@ -322,6 +329,28 @@ class MemoryWindow(QDialog):
         self.refresh()
         StyledDialog.notice(
             self, "整理记忆", f"整理失败：{message}\n\n待整理的会话会保留，之后再试即可。"
+        )
+
+    def _reset(self) -> None:
+        if self._store is None:
+            return
+        if not StyledDialog.confirm(
+            self,
+            "重置记忆",
+            f"将删除角色「{self._character}」的全部内容：\n\n"
+            "· 长期记忆与归档\n· 月度摘要\n· 全部对话记录\n\n"
+            "删除后无法恢复，别名表会保留。确定继续吗？",
+            confirm="全部删除",
+            danger=True,
+        ):
+            return
+        removed = self._store.reset()
+        self._store.new_session()
+        self.refresh()
+        # 通知主窗口把对话窗与当前会话也翻新
+        self.reset_requested.emit()
+        StyledDialog.notice(
+            self, "重置记忆", f"已删除 {removed} 个文件，记忆与对话记录都已回到初始状态。"
         )
 
     # ---- 窗口 ---------------------------------------------------------------

@@ -1,5 +1,6 @@
 """Interactive desktop pet window and its floating utilities."""
 from __future__ import annotations
+import math
 import random
 from pathlib import Path
 from typing import Callable
@@ -40,6 +41,12 @@ ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
 #: 立绘素材本身的朝向：True 表示默认朝向屏幕左侧。
 #: 随机移动按这张表决定镜像；拖拽沿用"向左即镜像"的写法。
 ART_FACES_LEFT = True
+
+#: 随机移动的恒定速度（像素/秒）。动画时长由距离换算而来，
+#: 所以走得远近只影响走多久，不影响走多快。
+MOVE_SPEED = 130
+#: 单次移动的时长上下限，避免极短距离一闪而过、极长距离磨磨蹭蹭
+MOVE_MIN_MS, MOVE_MAX_MS = 260, 2600
 
 
 def wander_mirrored(delta_x: int) -> bool:
@@ -95,6 +102,16 @@ def motion_profile(level: int) -> tuple[int, float, int]:
     chance = 0.03 + (level - 1) * 0.055
     distance = 30 + (level - 1) * 12
     return interval, chance, distance
+
+
+def move_duration(start: QPoint, target: QPoint) -> int:
+    """按恒定速度把位移换算成动画时长。
+
+    原来所有移动都固定 650ms，于是距离越远跑得越快；这里让时长正比于距离，
+    移动速度就与距离无关了。
+    """
+    length = math.hypot(target.x() - start.x(), target.y() - start.y())
+    return max(MOVE_MIN_MS, min(MOVE_MAX_MS, round(length / MOVE_SPEED * 1000)))
 
 
 class ChatInput(QTextEdit):
@@ -463,7 +480,7 @@ class PetWindow(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
-        self.animation = QPropertyAnimation(self, b'pos', self); self.animation.setDuration(650); self.animation.finished.connect(self._on_wander_finished)
+        self.animation = QPropertyAnimation(self, b'pos', self); self.animation.finished.connect(self._on_wander_finished)
         self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy)
         self.conversation.consolidated.connect(self._on_consolidated)
         self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self.load_character(load_settings()); self._place()
@@ -499,6 +516,9 @@ class PetWindow(QWidget):
     def begin_new_session(self) -> None:
         """启动时开一段全新会话：历史靠长期记忆承载，对话窗从空开始。"""
         self.conversation.start_new_session(); self.chat.load_history([])
+    def reset_memory(self) -> None:
+        """记忆被清空后：另起一段新会话，并把对话窗里的历史一并抹掉。"""
+        self.conversation.reset_memory(); self.chat.load_history([]); self.say('记忆已清空')
     def _on_consolidated(self, added: int, merged: int) -> None:
         if added > 0: self.say(f'记忆已整理，新增 {added} 条')
     def show_pet(self) -> None:
@@ -584,7 +604,7 @@ class PetWindow(QWidget):
         if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
         _, chance, distance = motion_profile(self.activity)
         if random.random()>chance: return
-        area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-distance,distance))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-distance//2,distance//2)))); self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.start()
+        area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-distance,distance))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-distance//2,distance//2)))); self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.setDuration(move_duration(self.pos(), target)); self.animation.start()
     def say(self,text:str,duration:int=2300)->None:
         self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide); self.canvas.show_temporary('Talk',duration)
 

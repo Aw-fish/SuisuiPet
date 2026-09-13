@@ -455,6 +455,32 @@ class MemoryStore:
                 return True
         return False
 
+    def reset(self) -> int:
+        """清空这个角色的全部记忆与对话记录，返回删除的文件数。
+
+        删掉记忆条目、归档、月度摘要、会话日志、FTS5 索引与待整理清单。
+        ``aliases.json`` 是用户手工维护的别名表，不属于记忆内容，予以保留。
+        """
+        removed = 0
+        for path in (self.entries_path, self.archive_path, self.pending_path, self.legacy_summary_path):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+                removed += 1
+        # SQLite 可能留下 -wal / -shm 临时文件，一并清掉
+        for path in sorted(self.root.glob(f"{INDEX_NAME}*")):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+                removed += 1
+        for directory in (self.sessions_dir, self.summaries_dir):
+            if not directory.is_dir():
+                continue
+            for entry in sorted(directory.iterdir()):
+                if entry.is_file():
+                    entry.unlink(missing_ok=True)
+                    removed += 1
+        self._pending_marked.clear()
+        return removed
+
     def forget_archived(self, ids: list[str]) -> int:
         """从归档文件里删除指定记忆（归档不影响对话，但删除不可恢复）。"""
         wanted = {str(item) for item in ids}

@@ -74,6 +74,8 @@ class ComboBox(QComboBox):
 
 class SettingsWindow(QMainWindow):
     settings_saved = Signal(dict)
+    #: 记忆被清空后转发出去，由主窗口同步对话窗
+    memory_reset = Signal()
     ACCENT = "#917DE8"
 
     def __init__(self) -> None:
@@ -496,6 +498,7 @@ class SettingsWindow(QMainWindow):
             return
         if self._memory_window is None:
             self._memory_window = MemoryWindow(self, name)
+            self._memory_window.reset_requested.connect(self.memory_reset)
         else:
             self._memory_window.set_character(name)
         self._memory_window.show()
