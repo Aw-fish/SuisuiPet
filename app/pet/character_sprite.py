@@ -23,7 +23,6 @@ ACTION_NAMES = frozenset({"Default", "Idle", "Move", "Talk", "Focus", "Drag"})
 
 #: 表情素材的中文显示名（未知表情直接显示原名）
 EXPRESSION_LABELS: dict[str, str] = {
-    "Blink": "眨眼",
     "Happy": "开心",
     "Sad": "难过",
     "Angry": "生气",
@@ -41,9 +40,10 @@ FALLBACKS: dict[str, tuple[str, ...]] = {
     "Drag": ("Drag", "Idle", DEFAULT_NAME),
 }
 
-#: 扁平命名没有 manifest 承载帧率，播放速度集中定义在这里
-FPS: dict[str, int] = {"Idle": 5, "Move": 10, "Talk": 9, "Focus": 4, "Drag": 8}
-DEFAULT_FPS = 6
+#: 扁平命名没有 manifest 承载帧率，播放速度集中定义在这里。
+#: 表情等未列出的动作走 DEFAULT_FPS。
+FPS: dict[str, int] = {"Idle": 4, "Move": 8, "Talk": 7, "Focus": 3, "Drag": 6}
+DEFAULT_FPS = 5
 
 
 def mirror(pixmap: QPixmap) -> QPixmap:

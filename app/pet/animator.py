@@ -7,14 +7,14 @@ from PySide6.QtGui import QPixmap
 
 from app.pet.character_sprite import CharacterAssets
 
-#: 临时动作（眨眼、说话等）的额外帧率覆盖
-TEMPORARY_FPS: dict[str, int] = {"Blink": 8, "Talk": 9}
+#: 临时动作（说话等）的额外帧率覆盖
+TEMPORARY_FPS: dict[str, int] = {"Talk": 7}
 
 
 class SpriteAnimator(QObject):
     """Advances the current action's frames and supports temporary overrides.
 
-    基础状态由 :meth:`set_state` 决定；:meth:`show_temporary` 用于说话、眨眼这类
+    基础状态由 :meth:`set_state` 决定；:meth:`show_temporary` 用于说话这类
     "播放一段后自动回到基础状态"的动作，优先级高于基础状态。
     """
 
