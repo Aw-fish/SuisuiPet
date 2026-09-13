@@ -17,6 +17,7 @@ from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.conversation.service import check_connection
 from app.ui.dialogs import StyledDialog
 from app.ui.icons import app_icon
+from app.ui.memory_window import MemoryWindow
 from app.ui.menus import styled_menu
 
 
@@ -82,6 +83,7 @@ class SettingsWindow(QMainWindow):
         self.drag_position: QPoint | None = None
         self._active_character: str | None = None
         self._character_cache: dict[str, dict] = {}
+        self._memory_window: MemoryWindow | None = None
         self._test_worker: _ConnectWorker | None = None
         # 拦截器必须被持有，否则会被 Python 回收导致失效
         self._wheel_guards: list[_WheelGuard] = []
@@ -192,10 +194,14 @@ class SettingsWindow(QMainWindow):
         self.remove_character = QPushButton("删除角色", objectName="mini")
         self.remove_character.setToolTip("断开连接或连同数据一起删除")
         self.remove_character.clicked.connect(self._remove_character)
+        self.memory_button = QPushButton("记忆", objectName="mini")
+        self.memory_button.setToolTip("查看与整理这个角色的长期记忆")
+        self.memory_button.clicked.connect(self._open_memory_window)
         picker.addWidget(self.character, 1)
         picker.addWidget(self.add_character)
         picker.addWidget(self.import_character_button)
         picker.addWidget(self.remove_character)
+        picker.addWidget(self.memory_button)
         layout.addLayout(picker)
         layout.addSpacing(10)
         layout.addWidget(self._label("角色模型"))
@@ -481,6 +487,20 @@ class SettingsWindow(QMainWindow):
             self._store_character_fields(self._active_character)
         self._active_character = name
         self._load_character_fields(name)
+        if self._memory_window is not None and self._memory_window.isVisible():
+            self._memory_window.set_character(name)
+
+    def _open_memory_window(self) -> None:
+        name = self._active_character or self.data["character"]["selected"]
+        if not name:
+            return
+        if self._memory_window is None:
+            self._memory_window = MemoryWindow(self, name)
+        else:
+            self._memory_window.set_character(name)
+        self._memory_window.show()
+        self._memory_window.raise_()
+        self._memory_window.activateWindow()
 
     def _add_character(self) -> None:
         name = StyledDialog.ask_text(

@@ -109,7 +109,7 @@ class _StreamWorker(QThread):
         self.finished.emit("".join(parts))
 
 
-class _ConsolidationWorker(QThread):
+class ConsolidationWorker(QThread):
     """在后台整理记忆：抽取事实 / 偏好 / 事件 / 约定并合并摘要。"""
 
     done = Signal(int, int)
@@ -152,7 +152,7 @@ class ConversationService(QObject):
         self._base_prompt = ""
         self._memory: MemoryStore | None = None
         self._worker: _StreamWorker | None = None
-        self._consolidator: _ConsolidationWorker | None = None
+        self._consolidator: ConsolidationWorker | None = None
         self._splitter = SentenceSplitter()
 
     # ---- 配置 ---------------------------------------------------------------
@@ -200,7 +200,7 @@ class ConversationService(QObject):
         """后台整理所有待处理会话。幂等，可安全重复调用。"""
         if self._memory is None or self._consolidator is not None:
             return
-        worker = _ConsolidationWorker(self._memory, self._info, self)
+        worker = ConsolidationWorker(self._memory, self._info, self)
         worker.done.connect(self._on_consolidated)
         worker.failed.connect(self._on_consolidation_failed)
         worker.finished.connect(self._on_consolidation_finished)

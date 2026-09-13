@@ -19,6 +19,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from app import characters
 from app.conversation.message import (
@@ -130,8 +131,8 @@ class MemoryEntry:
         """不含相关性的基础分（重要度 × 新鲜度）。"""
         return self.importance_factor * max(self.freshness(now), 0.15)
 
-    def to_record(self) -> dict:
-        record: dict = {
+    def to_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
             "id": self.id,
             "ts": self.ts,
             "kind": self.kind,
@@ -149,7 +150,7 @@ class MemoryEntry:
         return record
 
     @classmethod
-    def from_record(cls, record: dict) -> "MemoryEntry":
+    def from_record(cls, record: dict[str, Any]) -> "MemoryEntry":
         kind = str(record.get("kind", KIND_FACT))
         if kind not in KINDS:
             kind = KIND_FACT
@@ -325,24 +326,34 @@ class MemoryStore:
 
     # ---- L3 记忆条目 ---------------------------------------------------------
 
-    def entries(self, include_archived: bool = False) -> list[MemoryEntry]:
+    @staticmethod
+    def _read_entries(path: Path) -> list[MemoryEntry]:
         found: list[MemoryEntry] = []
-        for path in (self.entries_path, self.archive_path) if include_archived else (self.entries_path,):
-            if not path.is_file():
+        if not path.is_file():
+            return found
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict):
-                    entry = MemoryEntry.from_record(record)
-                    if entry.id and entry.text:
-                        found.append(entry)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                entry = MemoryEntry.from_record(record)
+                if entry.id and entry.text:
+                    found.append(entry)
         return found
+
+    def entries(self, include_archived: bool = False) -> list[MemoryEntry]:
+        found = self._read_entries(self.entries_path)
+        if include_archived:
+            found += self._read_entries(self.archive_path)
+        return found
+
+    def archived(self) -> list[MemoryEntry]:
+        """归档文件里的记忆（已移出检索池）。"""
+        return self._read_entries(self.archive_path)
 
     def _write_entries(self, entries: list[MemoryEntry]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -443,6 +454,32 @@ class MemoryStore:
                 self.rebuild_index()
                 return True
         return False
+
+    def forget_archived(self, ids: list[str]) -> int:
+        """从归档文件里删除指定记忆（归档不影响对话，但删除不可恢复）。"""
+        wanted = {str(item) for item in ids}
+        if not wanted or not self.archive_path.is_file():
+            return 0
+        kept: list[str] = []
+        removed = 0
+        for line in self.archive_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                kept.append(stripped)
+                continue
+            if isinstance(record, dict) and str(record.get("id")) in wanted:
+                removed += 1
+                continue
+            kept.append(stripped)
+        if removed:
+            self.archive_path.write_text(
+                "".join(line + "\n" for line in kept), encoding="utf-8"
+            )
+        return removed
 
     def decay(self, now: datetime | None = None) -> int:
         """把有效权重过低的记忆移进归档文件，返回归档条数。"""
@@ -584,7 +621,9 @@ class MemoryStore:
 
     # ---- L1 上下文组装 -------------------------------------------------------
 
-    def build_context(self, system_prompt: str, limit: int, query: str = "") -> list[dict]:
+    def build_context(
+        self, system_prompt: str, limit: int, query: str = ""
+    ) -> list[dict[str, Any]]:
         sections: list[str] = []
         if system_prompt.strip():
             sections.append(system_prompt.strip())
@@ -600,7 +639,7 @@ class MemoryStore:
         summary = self.summary_text()
         if summary:
             sections.append(f"更早的对话摘要：\n{summary}")
-        context: list[dict] = []
+        context: list[dict[str, Any]] = []
         if sections:
             context.append({"role": ROLE_SYSTEM, "content": "\n\n".join(sections)})
         history = [
