@@ -49,7 +49,7 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 
 ### 2. AI 对话
 
-- ✅ 可隐藏的浮动对话窗，消息气泡自适应宽度、自动滚底、标题栏可拖动。
+- ✅ 浮动对话窗（**只由右键角色菜单打开**，设置里不再有开关），消息气泡自适应宽度、自动滚底、标题栏可拖动。
 - ✅ **真实流式对话**：OpenAI 兼容接口（默认 DeepSeek），增量文本按 ~25fps 合并刷新。
 - ✅ **随时可打断**：生成中「发送」变「停止」，已生成的部分保留并标记 `interrupted`。
 - ✅ 生成中桌宠自动切到说话动作，结束后回到基础状态。
@@ -74,7 +74,7 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 - ✅ 系统托盘常驻图标，右键菜单可打开设置 / 退出。
 - ✅ 设置面板（900×740，无边框三页）：
   - **角色设置**：角色选择 + 添加 / 导入 / 删除角色（可断开连接或删除数据）、角色模型格式（img / live2d）、模型文件位置、移动频率、AI 模型名称、API 地址、代理、API Key、温度与上下文轮数、角色提示词、测试连接，以及「记忆」按钮（打开该角色的记忆管理窗口）；
-  - **模式设置**：动作模式、对话模式（显示浮动对话框 / 隐藏对话窗口）、基础提示词（对所有角色生效的说话风格约束，可一键恢复默认）；
+  - **模式设置**：动作模式、基础提示词（对所有角色生效的说话风格约束，可一键恢复默认）；
   - **工具**：番茄钟时长、天气城市。
 - ✅ 设置持久化到 `data/settings.json`，旧格式自动迁移。
 - ⬜ 托盘图标未连接单击/双击事件，目前只能通过右键菜单进入设置。
@@ -170,13 +170,14 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 ```json
 {
   "character": { "selected": "Suisui", "registered": ["Suisui"] },
-  "conversation": { "show_floating_dialog": false, "base_prompt": "……" },
+  "conversation": { "base_prompt": "……" },
   "motion": { "mode": "stationary" },
   "tools": { "pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": true }
 }
 ```
 
 - `conversation.base_prompt`：**与角色无关**的通用说话约束（口语化、限制长度、纯文本、不分段等），组装 system 时拼在角色提示词**前面**。在「设置 → 模式设置」里编辑，清空会自动还原默认值。
+- 旧的 `conversation.show_floating_dialog`（对话模式开关）已废弃：对话窗只由右键角色菜单打开，保存设置时会自动清掉这个残留键。
 - `motion.mode`：`movable` 自由移动 / `stationary` 固定位置。
 - `registered` 是已挂载的角色名列表；文件夹不存在的条目会在加载时自动剔除。
 - 旧版把角色配置内嵌在 `settings.json` 里的结构，会在首次加载时自动拆分到角色目录。
@@ -261,6 +262,8 @@ memory/
 - 设置变更通过 `SettingsWindow.settings_saved` 信号广播，由 `PetWindow.apply_settings` 响应。
 - 立绘动作名与表情名集中在 `app/pet/character_sprite.py`（`ACTION_NAMES` / `EXPRESSION_LABELS`）。
 - 移动方向镜像由 `pet_window.py` 的 `wander_mirrored()`（随机移动）与 `drag_mirrored()`（拖拽）分别决定，素材默认朝向由 `ART_FACES_LEFT` 常量控制，改这一处即可整体反转。
+- 拖拽朝向经 `DragDirection` 判定：**首次移动直接定朝向**，之后要累计越过 `DRAG_FLIP_THRESHOLD`（6px）才翻转，否则手抖会让立绘左右抽动。
+- **按下鼠标时先 `animation.stop()`**：随机游走的位移动画会持续驱动窗口位置，不停掉就会与拖拽互相拉扯。
 - 样式统一写在类内的 QSS 字符串中，无独立样式文件；窗口均为无边框，拖动逻辑各自实现。
 
 ## 后续可迭代方向

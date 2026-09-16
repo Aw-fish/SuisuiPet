@@ -61,6 +61,41 @@ def drag_mirrored(delta_x: int) -> bool:
     return delta_x < 0
 
 
+#: 拖拽时方向翻转所需的最小累计位移（像素）。手抖会让相邻两次鼠标事件的位移方向
+#: 来回变化，直接按单次位移判定，立绘就会左右抽动；这里累计到位再翻转。
+DRAG_FLIP_THRESHOLD = 6
+
+
+class DragDirection:
+    """拖拽朝向判定器：首次移动直接定朝向，之后要累计越过阈值才翻转。"""
+
+    def __init__(self, threshold: int = DRAG_FLIP_THRESHOLD) -> None:
+        self._threshold = threshold
+        self._drift = 0
+        self._mirrored = False
+        self._decided = False
+
+    def reset(self) -> None:
+        """每次按下滑鼠重新开始判定。"""
+        self._drift = 0
+        self._mirrored = False
+        self._decided = False
+
+    def update(self, delta_x: int) -> bool:
+        if not self._decided:
+            # 第一次真的动了，立刻定下朝向，不必等累积到阈值
+            if delta_x == 0:
+                return self._mirrored
+            self._mirrored = drag_mirrored(delta_x)
+            self._decided = True
+            return self._mirrored
+        self._drift += delta_x
+        if abs(self._drift) >= self._threshold:
+            self._mirrored = drag_mirrored(self._drift)
+            self._drift = 0
+        return self._mirrored
+
+
 def current_character(data: dict) -> tuple[str, dict]:
     """返回 (角色名, 角色配置)；没有选中角色时返回空配置。"""
     name = str(data.get("character", {}).get("selected") or "").strip()
@@ -476,7 +511,7 @@ class PetCanvas(QWidget):
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
@@ -566,7 +601,8 @@ class PetWindow(QWidget):
     def _restore_state(self) -> None:
         self.canvas.set_state(self._base_state())
     def _on_wander_finished(self) -> None:
-        self._restore_state()
+        # 拖拽中不要覆盖 Drag 姿态（松手时 mouseReleaseEvent 会自己恢复）
+        if not self.drag: self._restore_state()
     def _build_context_menu(self) -> QMenu:
         d=load_settings(); movable=d['motion']['mode']=='movable'; m=styled_menu(self)
         a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator()
@@ -576,11 +612,14 @@ class PetWindow(QWidget):
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
         self._build_context_menu().exec(e.globalPos())
     def mousePressEvent(self,e:QMouseEvent)->None:
-        if e.button()==Qt.LeftButton: self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft(); self.canvas.set_state('Drag')
+        if e.button()==Qt.LeftButton:
+            # 抓住角色时先停掉随机游走：否则动画会继续驱动窗口位置，和拖拽互相拉扯
+            self.animation.stop(); self._drag_direction.reset()
+            self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft(); self.canvas.set_state('Drag')
     def mouseMoveEvent(self,e:QMouseEvent)->None:
         if self.drag and e.buttons()&Qt.LeftButton:
             position=e.globalPosition().toPoint()-self.drag
-            self.canvas.set_state('Drag', mirrored=drag_mirrored(position.x()-self.x())); self.move(position); self.timer_window.place()
+            self.canvas.set_state('Drag', mirrored=self._drag_direction.update(position.x()-self.x())); self.move(position); self.timer_window.place()
     def mouseReleaseEvent(self,e:QMouseEvent)->None:
         if e.button()==Qt.LeftButton: self.drag=None; self._restore_state()
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
@@ -588,8 +627,7 @@ class PetWindow(QWidget):
     def toggle_mode(self)->None:
         d=load_settings(); d['motion']['mode']='stationary' if d['motion']['mode']=='movable' else 'movable'; save_settings(d); self.refresh_settings(d); self.say('固定位置' if d['motion']['mode']=='stationary' else '自由移动')
     def apply_settings(self, data:dict)->None:
-        if data['conversation']['show_floating_dialog']: self.chat.show_near(self)
-        else: self.close_chat()
+        # 对话窗的开关已取消：只由右键菜单打开，保存设置不再改动它的可见性
         self.load_character(data); self.show_pet()
         if self.isVisible(): self.say('设置已保存')
     def close_chat(self)->None: self.chat.hide()

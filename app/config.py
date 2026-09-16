@@ -30,7 +30,7 @@ BASE_SYSTEM_PROMPT = (
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "character": {"selected": "Suisui", "registered": ["Suisui"]},
-    "conversation": {"show_floating_dialog": False, "base_prompt": BASE_SYSTEM_PROMPT},
+    "conversation": {"base_prompt": BASE_SYSTEM_PROMPT},
     "motion": {"mode": "stationary"},
     "tools": {"pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": True},
 }

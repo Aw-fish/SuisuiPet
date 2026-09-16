@@ -48,6 +48,42 @@ class _WheelGuard(QObject):
         return super().eventFilter(watched, event)
 
 
+#: 「基础提示词」的固定高度，同时也是「角色提示词」自动增高的上限
+BASE_PROMPT_HEIGHT = 146
+#: 「角色提示词」的起始高度
+CHARACTER_PROMPT_HEIGHT = 110
+
+
+class GrowingTextEdit(QTextEdit):
+    """随内容自动增高、到上限为止的输入框。
+
+    高度按文档排版后的真实高度算；``_chrome``（边框 + 内边距）用实测差值取，
+    这样不必关心样式表里写的是多少 padding。
+    """
+
+    def __init__(self, minimum: int, maximum: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._minimum = minimum
+        self._maximum = maximum
+        self._chrome = 0
+        self.setFixedHeight(minimum)
+        self.textChanged.connect(self._fit)
+
+    def _fit(self) -> None:
+        document = self.document()
+        document.setTextWidth(max(1, self.viewport().width()))
+        needed = document.size().height() + self._chrome
+        target = int(max(self._minimum, min(self._maximum, needed)))
+        if target != self.height():
+            self.setFixedHeight(target)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        # 边框与内边距是常量，每次重新量一遍最稳妥（不依赖样式表何时生效）
+        self._chrome = max(0, self.height() - self.viewport().height())
+        self._fit()
+
+
 class ComboBox(QComboBox):
     """下拉框：去掉系统方投影，并把圆角画在弹出容器上，避免露出直角。
 
@@ -282,7 +318,8 @@ class SettingsWindow(QMainWindow):
         params.addLayout(limit_box, 1)
         layout.addLayout(params)
         layout.addWidget(self._label("角色提示词"))
-        self.prompt = QTextEdit(); self.prompt.setFixedHeight(88); self.prompt.setPlaceholderText("描述角色的性格、语气与对话边界……")
+        self.prompt = GrowingTextEdit(CHARACTER_PROMPT_HEIGHT, BASE_PROMPT_HEIGHT)
+        self.prompt.setPlaceholderText("描述角色的性格、语气与对话边界……")
         layout.addWidget(self.prompt)
         test_row = QHBoxLayout()
         test_row.setSpacing(10)
@@ -300,7 +337,7 @@ class SettingsWindow(QMainWindow):
         self.activity_value.setText(f"{value} / 10")
 
     def _mode_page(self) -> QWidget:
-        page, layout = self._page("模式设置", "分别控制角色在桌面上的行为、对话入口与全局对话风格。")
+        page, layout = self._page("模式设置", "控制角色在桌面上的行为，以及对所有角色生效的对话风格。")
         layout.addWidget(self._label("角色动作模式"))
         self.movable, self.stationary = QRadioButton("自由移动"), QRadioButton("固定位置")
         self.motion_group = QButtonGroup(self)
@@ -308,16 +345,9 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self.movable); layout.addWidget(QLabel("允许在桌面上移动。", objectName="hint"))
         layout.addWidget(self.stationary); layout.addWidget(QLabel("固定在当前位置。", objectName="hint"))
         layout.addSpacing(20)
-        layout.addWidget(self._label("对话模式"))
-        self.floating, self.hidden = QRadioButton("显示浮动对话框"), QRadioButton("隐藏对话窗口")
-        self.dialog_group = QButtonGroup(self)
-        self.dialog_group.addButton(self.floating); self.dialog_group.addButton(self.hidden)
-        layout.addWidget(self.floating); layout.addWidget(self.hidden)
-        layout.addWidget(QLabel("隐藏后仍可从任务栏角标或角色交互中调出。", objectName="hint"))
-        layout.addSpacing(20)
         layout.addWidget(self._label("基础提示词（对所有角色生效）"))
         self.base_prompt = QTextEdit()
-        self.base_prompt.setFixedHeight(146)
+        self.base_prompt.setFixedHeight(BASE_PROMPT_HEIGHT)
         self.base_prompt.setPlaceholderText("约束整体说话风格，例如回复长度、语气与格式……")
         layout.addWidget(self.base_prompt)
         prompt_row = QHBoxLayout()
@@ -594,7 +624,6 @@ class SettingsWindow(QMainWindow):
         self._refresh_character_combo(selected)
         self.movable.setChecked(self.data["motion"]["mode"] == "movable")
         self.stationary.setChecked(not self.movable.isChecked())
-        self.floating.setChecked(a["show_floating_dialog"]); self.hidden.setChecked(not self.floating.isChecked())
         self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
 
@@ -605,7 +634,8 @@ class SettingsWindow(QMainWindow):
         self._store_character_fields(name)
         self.data["character"]["selected"] = name
         self.data["conversation"].pop("api_url", None)
-        self.data["conversation"]["show_floating_dialog"] = self.floating.isChecked()
+        # 对话窗现在只由右键菜单打开，不再有开关，顺手清掉历史残留的键
+        self.data["conversation"].pop("show_floating_dialog", None)
         # 清空就还原默认，避免不小心把通用约束删没了
         self.data["conversation"]["base_prompt"] = self.base_prompt.toPlainText().strip() or BASE_SYSTEM_PROMPT
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
