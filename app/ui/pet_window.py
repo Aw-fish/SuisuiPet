@@ -2,6 +2,7 @@
 from __future__ import annotations
 import math
 import random
+import time
 from pathlib import Path
 from typing import Callable
 from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt, Signal
@@ -13,6 +14,7 @@ from app.conversation.message import ROLE_ASSISTANT, ROLE_USER
 from app.conversation.service import ConversationService
 from app.pet.animator import SpriteAnimator
 from app.pet.character_sprite import CharacterAssets
+from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
 from app.ui.dialogs import StyledDialog
 from app.ui.menus import styled_menu
 
@@ -47,6 +49,11 @@ ART_FACES_LEFT = True
 MOVE_SPEED = 130
 #: 单次移动的时长上下限，避免极短距离一闪而过、极长距离磨磨蹭蹭
 MOVE_MIN_MS, MOVE_MAX_MS = 260, 2600
+
+#: 身上带着情绪表情时，随机移动的概率乘以这个系数。
+#: 表情只在待机时露脸，一走起来就被 Move 素材盖住了，所以有表情时让它多待一会儿
+#: —— 只是调低概率，不是禁止移动。
+MOOD_MOVE_DAMPING = 0.3
 
 
 def wander_mirrored(delta_x: int) -> bool:
@@ -492,6 +499,11 @@ class PetCanvas(QWidget):
     def clear_expression(self) -> None:
         self.animator.unpin()
 
+    def set_mood(self, state: str | None) -> None:
+        """情绪表情：待机时露脸，走路 / 拖拽 / 说话时让位给各自的素材。"""
+        if self.has_sprite:
+            self.animator.set_mood(state)
+
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         pixmap = self.animator.current()
         if pixmap is not None:
@@ -511,14 +523,15 @@ class PetCanvas(QWidget):
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
         self.animation = QPropertyAnimation(self, b'pos', self); self.animation.finished.connect(self._on_wander_finished)
         self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy)
         self.conversation.consolidated.connect(self._on_consolidated)
-        self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self.load_character(load_settings()); self._place()
+        self.conversation.mood_changed.connect(self._on_mood_changed)
+        self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
     def _sync_geometry(self) -> None:
@@ -541,7 +554,14 @@ class PetWindow(QWidget):
         self.wander.setInterval(motion_profile(self.activity)[0])
         if not self.wander.isActive(): self.wander.start()
         self.canvas.set_assets(assets); self._sync_geometry()
+        # 素材换了，之前那张情绪脸已经不存在，同步清掉
+        self._mood_timer.stop(); self._mood_state = None
         name, info = current_character(data)
+        # 自动表情开关与灵敏度跟随设置（启动、换角色、保存设置都会走到这里）
+        self.set_auto_expression(
+            bool(data.get('conversation', {}).get('auto_expression', True)),
+            data.get('conversation', {}).get('expression_sensitivity', DEFAULT_SENSITIVITY),
+        )
         self.conversation.configure(name, info, data.get("conversation", {}).get("base_prompt", ""))
         self.chat.set_title(name)
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
@@ -576,6 +596,27 @@ class PetWindow(QWidget):
             f"请把 Default.png 等图片放进：\n{folder or 'data/characters/<角色名>/sprites'}\n\n"
             "也可以在「设置 → 角色设置」里检查立绘目录或切换角色。",
         )
+    def set_auto_expression(self, enabled: bool, sensitivity: int = DEFAULT_SENSITIVITY) -> None:
+        """开启自动表情，并按灵敏度换算切换节奏（见 app/pet/emotion.py 的参数表）。"""
+        was_enabled = self._auto_expression
+        self._auto_expression = bool(enabled)
+        self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(sensitivity)
+        self.conversation.set_auto_expression(bool(enabled))
+        if was_enabled and not enabled: self._clear_mood()
+    def _on_mood_changed(self, state: str | None) -> None:
+        """模型在回复里标出的表情：立刻生效，超时没有新情绪就回到默认立绘。"""
+        if not self._auto_expression: return
+        if state != self._mood_state:
+            # 最短停留：刚换过就不再跟着下一句翻，避免短句连发时表情来回抽动
+            if (time.monotonic() - self._mood_changed_at) * 1000 < self._mood_dwell_ms: return
+            self._mood_state = state; self._mood_changed_at = time.monotonic(); self.canvas.set_mood(state)
+        self._mood_timer.start(self._mood_timeout_ms)
+    def _expire_mood(self) -> None:
+        self._clear_mood()
+    def _clear_mood(self) -> None:
+        self._mood_timer.stop()
+        self._mood_state = None
+        self.canvas.set_mood(None)
     def _set_expression(self, name: str | None) -> None:
         """固定显示某个表情立绘；恢复默认时回到默认立绘并重新开启随机动作。"""
         if name is not None and (self.assets is None or not self.assets.has(name)):
@@ -641,6 +682,7 @@ class PetWindow(QWidget):
     def _wander(self)->None:
         if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
         _, chance, distance = motion_profile(self.activity)
+        if self._mood_state is not None: chance *= MOOD_MOVE_DAMPING
         if random.random()>chance: return
         area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-distance,distance))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-distance//2,distance//2)))); self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.setDuration(move_duration(self.pos(), target)); self.animation.start()
     def say(self,text:str,duration:int=2300)->None:

@@ -7,7 +7,7 @@ from PySide6.QtCore import QEvent, QEasingCurve, QObject, QPoint, QPropertyAnima
 from PySide6.QtGui import QAction, QDesktopServices
 
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
     QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
     QPushButton, QRadioButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
     QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from app import characters
 from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.conversation.service import check_connection
+from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
 from app.ui.dialogs import StyledDialog
 from app.ui.icons import app_icon
 from app.ui.memory_window import MemoryWindow
@@ -182,7 +183,7 @@ class SettingsWindow(QMainWindow):
         shell.addWidget(sidebar)
         shell.addWidget(content, 1)
         # 数值控件一律不吃滚轮，避免滚动页面时误改设置
-        self._block_wheel(self.temperature, self.context_limit, self.activity, self.pomodoro)
+        self._block_wheel(self.temperature, self.context_limit, self.activity, self.pomodoro, self.expression_sensitivity)
         self.setStyleSheet(self._qss())
 
     def _block_wheel(self, *widgets: QWidget) -> None:
@@ -336,6 +337,17 @@ class SettingsWindow(QMainWindow):
     def _on_activity_changed(self, value: int) -> None:
         self.activity_value.setText(f"{value} / 10")
 
+    def _on_sensitivity_changed(self, value: int) -> None:
+        self.sensitivity_value.setText(f"{value} / 10")
+        dwell_ms, timeout_ms = mood_timing(value)
+        self.sensitivity_hint.setText(
+            f"越大切换越跟手：最短停留 {dwell_ms / 1000:g} 秒，"
+            f"{timeout_ms // 60000} 分钟没有新情绪就回到默认立绘。"
+        )
+
+    def _on_auto_expression_toggled(self, checked: bool) -> None:
+        self.expression_sensitivity.setEnabled(checked)
+
     def _mode_page(self) -> QWidget:
         page, layout = self._page("模式设置", "控制角色在桌面上的行为，以及对所有角色生效的对话风格。")
         layout.addWidget(self._label("角色动作模式"))
@@ -344,6 +356,31 @@ class SettingsWindow(QMainWindow):
         self.motion_group.addButton(self.movable); self.motion_group.addButton(self.stationary)
         layout.addWidget(self.movable); layout.addWidget(QLabel("允许在桌面上移动。", objectName="hint"))
         layout.addWidget(self.stationary); layout.addWidget(QLabel("固定在当前位置。", objectName="hint"))
+        layout.addSpacing(20)
+        layout.addWidget(self._label("自动表情"))
+        self.auto_expression = QCheckBox("随回复的语气切换立绘表情")
+        self.auto_expression.setToolTip("开启后提示词里会追加表情标记说明，模型在回复中标出的表情会切换立绘")
+        self.auto_expression.toggled.connect(self._on_auto_expression_toggled)
+        layout.addWidget(self.auto_expression)
+        layout.addWidget(QLabel("关闭后不再注入表情说明，也省下这段 token。", objectName="hint"))
+        layout.addWidget(self._label("表情切换灵敏度"))
+        sensitivity_row = QHBoxLayout()
+        sensitivity_row.setSpacing(10)
+        self.expression_sensitivity = QSlider(Qt.Horizontal)
+        self.expression_sensitivity.setRange(1, 10)
+        self.expression_sensitivity.setSingleStep(1)
+        self.expression_sensitivity.setPageStep(1)
+        self.expression_sensitivity.setFixedHeight(24)
+        self.expression_sensitivity.valueChanged.connect(self._on_sensitivity_changed)
+        self.sensitivity_value = QLabel(objectName="chip")
+        self.sensitivity_value.setAlignment(Qt.AlignCenter)
+        self.sensitivity_value.setFixedWidth(52)
+        sensitivity_row.addWidget(self.expression_sensitivity, 1)
+        sensitivity_row.addWidget(self.sensitivity_value)
+        layout.addLayout(sensitivity_row)
+        self.sensitivity_hint = QLabel("", objectName="hint")
+        self.sensitivity_hint.setWordWrap(True)
+        layout.addWidget(self.sensitivity_hint)
         layout.addSpacing(20)
         layout.addWidget(self._label("基础提示词（对所有角色生效）"))
         self.base_prompt = QTextEdit()
@@ -624,6 +661,13 @@ class SettingsWindow(QMainWindow):
         self._refresh_character_combo(selected)
         self.movable.setChecked(self.data["motion"]["mode"] == "movable")
         self.stationary.setChecked(not self.movable.isChecked())
+        self.auto_expression.setChecked(bool(a.get("auto_expression", True)))
+        try:
+            sensitivity = int(a.get("expression_sensitivity", DEFAULT_SENSITIVITY))
+        except (TypeError, ValueError):
+            sensitivity = DEFAULT_SENSITIVITY
+        self.expression_sensitivity.setValue(max(1, min(10, sensitivity)))
+        self._on_sensitivity_changed(self.expression_sensitivity.value())
         self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
 
@@ -638,6 +682,8 @@ class SettingsWindow(QMainWindow):
         self.data["conversation"].pop("show_floating_dialog", None)
         # 清空就还原默认，避免不小心把通用约束删没了
         self.data["conversation"]["base_prompt"] = self.base_prompt.toPlainText().strip() or BASE_SYSTEM_PROMPT
+        self.data["conversation"]["auto_expression"] = self.auto_expression.isChecked()
+        self.data["conversation"]["expression_sensitivity"] = self.expression_sensitivity.value()
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
         self._flush_characters()

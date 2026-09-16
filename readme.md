@@ -44,6 +44,7 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 - ✅ 移动方向镜像；随机移动与拖拽各自独立的方向规则（见「开发约定」）。
 - ✅ 动作频率可调：`移动频率` 1–10，同时控制触发间隔、触发概率与移动距离。
 - ✅ 表情：整张全身立绘的表情，可从右键菜单固定或恢复默认。
+- ✅ **自动表情**：模型在回复里内嵌 `[开心]` 这类标记，立绘随之换表情；标记会在流式文本里被剥离，**界面与落盘都看不到**。表情只在待机时露脸（走路 / 拖拽 / 说话 / 专注各用各的素材），并带最短停留与超时回归。带着表情时随机移动概率降到 30%，让它多露一会儿脸（只是调低，不是禁止移动）。可在「模式设置」里关闭，或用滑块调切换灵敏度。
 - ⬜ **Live2D 未接入**：`live2d格式` 目前只保存 JSON 路径，不参与渲染。
 - ⬜ 语音、音效、更多动作包。
 
@@ -74,7 +75,7 @@ data/characters/*/character.json   # 角色配置（含 API Key）
 - ✅ 系统托盘常驻图标，右键菜单可打开设置 / 退出。
 - ✅ 设置面板（900×740，无边框三页）：
   - **角色设置**：角色选择 + 添加 / 导入 / 删除角色（可断开连接或删除数据）、角色模型格式（img / live2d）、模型文件位置、移动频率、AI 模型名称、API 地址、代理、API Key、温度与上下文轮数、角色提示词、测试连接，以及「记忆」按钮（打开该角色的记忆管理窗口）；
-  - **模式设置**：动作模式、基础提示词（对所有角色生效的说话风格约束，可一键恢复默认）；
+  - **模式设置**：动作模式、自动表情（开关 + 切换灵敏度滑块）、基础提示词（对所有角色生效的说话风格约束，可一键恢复默认）；
   - **工具**：番茄钟时长、天气城市。
 - ✅ 设置持久化到 `data/settings.json`，旧格式自动迁移。
 - ⬜ 托盘图标未连接单击/双击事件，目前只能通过右键菜单进入设置。
@@ -100,6 +101,7 @@ SuisuiPet/
 │   │       ├── base.py              # Provider 抽象与 Chunk / ToolCall
 │   │       └── openai_compat.py     # OpenAI 兼容流式实现
 │   ├── pet/
+│   │   ├── emotion.py               # 情绪标记的剥离与切换节奏参数
 │   │   ├── character_sprite.py      # 扁平文件夹立绘扫描、兜底链、镜像、透明背景校验
 │   │   └── animator.py              # 帧播放驱动（基础状态 + 临时动作 + 固定表情）
 │   └── ui/
@@ -170,7 +172,7 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 ```json
 {
   "character": { "selected": "Suisui", "registered": ["Suisui"] },
-  "conversation": { "base_prompt": "……" },
+  "conversation": { "base_prompt": "……", "auto_expression": true, "expression_sensitivity": 5 },
   "motion": { "mode": "stationary" },
   "tools": { "pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": true }
 }
@@ -178,6 +180,8 @@ python tools/make_icon.py        # 写出 data/icon.png 与 data/icon.ico
 
 - `conversation.base_prompt`：**与角色无关**的通用说话约束（口语化、限制长度、纯文本、不分段等），组装 system 时拼在角色提示词**前面**。在「设置 → 模式设置」里编辑，清空会自动还原默认值。
 - 旧的 `conversation.show_floating_dialog`（对话模式开关）已废弃：对话窗只由右键角色菜单打开，保存设置时会自动清掉这个残留键。
+- `conversation.auto_expression`：开启后会在 system prompt 末尾追加一段表情标记说明（约 75 字），模型据此在回复里标表情。**关掉就连这段说明都不注入**，省下对应 token。
+- `conversation.expression_sensitivity`：表情切换灵敏度 1–10。参数表在 `app/pet/emotion.py` 的 `MOOD_TIMING`，想调节奏只改那一处。
 - `motion.mode`：`movable` 自由移动 / `stationary` 固定位置。
 - `registered` 是已挂载的角色名列表；文件夹不存在的条目会在加载时自动剔除。
 - 旧版把角色配置内嵌在 `settings.json` 里的结构，会在首次加载时自动拆分到角色目录。

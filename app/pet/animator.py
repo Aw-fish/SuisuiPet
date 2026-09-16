@@ -29,6 +29,7 @@ class SpriteAnimator(QObject):
         self._override: str | None = None
         self._override_mirrored = False
         self._pinned: str | None = None
+        self._mood: str | None = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
         self._expire = QTimer(self)
@@ -39,6 +40,7 @@ class SpriteAnimator(QObject):
         self._assets = assets
         self._override = None
         self._pinned = None
+        self._mood = None
         self._index = 0
         self._expire.stop()
         self._sync_timer()
@@ -66,6 +68,26 @@ class SpriteAnimator(QObject):
     @property
     def pinned(self) -> str | None:
         return self._pinned
+
+    @property
+    def mood(self) -> str | None:
+        return self._mood
+
+    def set_mood(self, state: str | None) -> None:
+        """设置情绪表情（``None`` 表示回到默认立绘）。
+
+        与 :meth:`pin` 的区别：pin 是用户手动固定，优先级最高且会暂停随机动作；
+        mood 只决定"待机时用哪张脸"，走路 / 拖拽 / 说话 / 专注时仍各用各的素材，
+        所以它不会让角色停下，也不会打断口型。
+        """
+        if state is not None and (self._assets is None or not self._assets.has(state)):
+            state = None
+        if state == self._mood:
+            return
+        self._mood = state
+        self._index = 0
+        self._sync_timer()
+        self.frame_changed.emit()
 
     def set_state(self, state: str, mirrored: bool = False, restart: bool = False) -> None:
         if self._assets is None:
@@ -106,6 +128,16 @@ class SpriteAnimator(QObject):
             return None
         return frames[self._index % len(frames)]
 
+    def _display_name(self) -> str:
+        """当前真正在播的素材名（用来取帧率）。"""
+        if self._pinned is not None:
+            return self._pinned
+        if self._override is not None:
+            return self._override
+        if self._mood is not None and self._state == "Idle":
+            return self._mood
+        return self._state
+
     def _frames(self) -> list[QPixmap]:
         if self._assets is None:
             return []
@@ -113,10 +145,14 @@ class SpriteAnimator(QObject):
             return self._assets.frames(self._pinned)
         if self._override is not None:
             return self._assets.frames(self._override, self._override_mirrored)
+        # 情绪只在待机时露脸：走路、拖拽、说话、专注都优先播各自的素材
+        if self._mood is not None and self._state == "Idle":
+            return self._assets.frames(self._mood)
         return self._assets.frames(self._state, self._mirrored)
 
     def _interval(self) -> int:
-        fps = TEMPORARY_FPS.get(self.state, CharacterAssets.fps(self.state))
+        name = self._display_name()
+        fps = TEMPORARY_FPS.get(name, CharacterAssets.fps(name))
         return max(40, round(1000 / fps))
 
     def _sync_timer(self) -> None:

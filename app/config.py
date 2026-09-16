@@ -30,7 +30,13 @@ BASE_SYSTEM_PROMPT = (
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "character": {"selected": "Suisui", "registered": ["Suisui"]},
-    "conversation": {"base_prompt": BASE_SYSTEM_PROMPT},
+    "conversation": {
+        "base_prompt": BASE_SYSTEM_PROMPT,
+        #: 让模型在回复里内嵌 [开心] 这类标记，立绘随之换表情
+        "auto_expression": True,
+        #: 表情切换灵敏度 1~10（越大越跟手，见 app/pet/emotion.py 的参数表）
+        "expression_sensitivity": 5,
+    },
     "motion": {"mode": "stationary"},
     "tools": {"pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": True},
 }

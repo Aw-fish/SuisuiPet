@@ -21,6 +21,7 @@ from app.conversation.message import Message, ROLE_ASSISTANT, ROLE_USER
 from app.conversation.providers.base import LLMProvider, ProviderError
 from app.conversation.providers.openai_compat import OpenAICompatProvider
 from app.conversation.sentence import SentenceSplitter
+from app.pet.emotion import EXPRESSION_HINT, TagFilter, mood_asset
 
 DEFAULT_LIMIT = 20
 DEFAULT_TEMPERATURE = 0.8
@@ -144,6 +145,8 @@ class ConversationService(QObject):
     busy_changed = Signal(bool)
     consolidated = Signal(int, int)
     consolidation_failed = Signal(str)
+    #: 回复里标出的表情（立绘素材名，None 表示回到默认立绘）
+    mood_changed = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -154,6 +157,9 @@ class ConversationService(QObject):
         self._worker: _StreamWorker | None = None
         self._consolidator: ConsolidationWorker | None = None
         self._splitter = SentenceSplitter()
+        self._tag_filter = TagFilter()
+        self._clean: list[str] = []
+        self._auto_expression = False
 
     # ---- 配置 ---------------------------------------------------------------
 
@@ -200,6 +206,10 @@ class ConversationService(QObject):
         self._memory.new_session()
         return removed
 
+    def set_auto_expression(self, enabled: bool) -> None:
+        """开启自动表情：提示词里追加表情标记说明，并按标记切换立绘表情。"""
+        self._auto_expression = bool(enabled)
+
     @property
     def consolidating(self) -> bool:
         return self._consolidator is not None
@@ -239,6 +249,8 @@ class ConversationService(QObject):
         if provider is None:
             self.failed.emit("没有配置 API 地址或模型名称，请到设置 → 角色设置里填写")
             return
+        self._tag_filter.reset()
+        self._clean.clear()
         self._memory.append(Message(role=ROLE_USER, content=text))
         # 把用户这句话交给记忆检索，召回与当前话题相关的长期记忆
         messages = self._memory.build_context(self._system_prompt(), self._context_limit(), text)
@@ -262,12 +274,23 @@ class ConversationService(QObject):
     # ---- 内部 ---------------------------------------------------------------
 
     def _on_delta(self, text: str) -> None:
-        self.delta.emit(text)
-        for sentence in self._splitter.feed(text):
+        # 先在流上剥掉情绪标记，下游（界面 / 落盘 / 句级切分）拿到的都是干净正文
+        clean, tags = self._tag_filter.feed(text)
+        for tag in tags:
+            self.mood_changed.emit(mood_asset(tag))
+        if not clean:
+            return
+        self._clean.append(clean)
+        self.delta.emit(clean)
+        for sentence in self._splitter.feed(clean):
             self.sentence.emit(sentence)
 
     def _on_finished(self, text: str) -> None:
-        self._finalize(text)
+        # worker 回传的是原始全文（还带着标记），所以用自己累计的干净文本收尾
+        tail, _tags = self._tag_filter.flush()
+        if tail:
+            self._clean.append(tail)
+        self._finalize("".join(self._clean))
 
     def _on_failed(self, message: str) -> None:
         self._finalize("", error=message)
@@ -292,6 +315,9 @@ class ConversationService(QObject):
             str(self._base_prompt).strip(),
             str(self._info.get("system_prompt", "")).strip(),
         ]
+        if self._auto_expression:
+            # 只在开启自动表情时才追加，关掉就省下这段 token
+            parts.append(EXPRESSION_HINT)
         return "\n\n".join(part for part in parts if part)
 
     def _context_limit(self) -> int:
