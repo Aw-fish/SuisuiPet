@@ -699,7 +699,8 @@ class PetWindow(QWidget):
         if random.random()>chance: return
         area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-distance,distance))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-distance//2,distance//2)))); self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.setDuration(move_duration(self.pos(), target)); self.animation.start()
     def say(self,text:str,duration:int=2300)->None:
-        self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide); self.canvas.show_temporary('Talk',duration)
+        # 气泡都是"在处理 / 状态提示"，一律配思考动作；说话动作只留给模型正文输出
+        self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide); self.canvas.show_temporary('Think',duration)
 
 
 
