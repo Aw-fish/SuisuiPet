@@ -22,6 +22,16 @@ INTERRUPT_HINT = (
     "但不要重复已经说过的内容，也不要假装那句话已经说完了。"
 )
 
+#: 环境提示（目前只有时间）的旁白标记，挂在当轮消息前面。
+#: 只进请求，和 INTERRUPT_MARK 一样不影响落盘与界面。
+NARRATION_TAG = "[旁白]"
+
+#: 上下文里真的带旁白时才注入，边界说清楚——不然模型会把时间当成常驻任务反复提起
+NARRATION_HINT = (
+    f"以 {NARRATION_TAG} 开头的是系统给你的环境提示（目前是当前时间），不是用户说的话。"
+    "按需参考即可：不要复述它，不要主动提起时间，也不要把它当成用户的请求。"
+)
+
 
 def now_stamp() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -36,15 +46,19 @@ class Message:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str = ""
 
-    def to_api(self) -> dict[str, Any]:
+    def to_api(self, narration: str = "") -> dict[str, Any]:
         """转成 OpenAI 兼容接口的 message 格式。
 
-        被打断的回复会在末尾补上 ``INTERRUPT_MARK``：模型拿到的是"说到一半就被掐了"
-        的上下文，而不是一句看起来已经说完的话。
+        两处只在**请求里**存在的修饰：
+
+        * 被打断的回复在末尾补 ``INTERRUPT_MARK``（模型才知道那是说到一半）；
+        * ``narration`` 作为 ``NARRATION_TAG`` 旁白加在最前面（当前时间这类环境提示）。
         """
         content = self.content
         if self.interrupted:
             content = f"{content}{INTERRUPT_MARK}" if content.strip() else INTERRUPT_MARK
+        if narration:
+            content = f"{NARRATION_TAG} {narration}\n{content}"
         payload: dict[str, Any] = {"role": self.role, "content": content}
         if self.tool_calls:
             payload["tool_calls"] = self.tool_calls

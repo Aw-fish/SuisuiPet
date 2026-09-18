@@ -12,11 +12,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.conversation import clock
 from app.conversation.memory import (
     KINDS,
     KIND_FACT,
     MemoryEntry,
     MemoryStore,
+    _parse,
     _stamp,
 )
 from app.conversation.message import ROLE_ASSISTANT, ROLE_USER
@@ -34,6 +36,8 @@ _SYSTEM = (
 
 _USER_TEMPLATE = """请从下面的对话里提炼值得长期记住的信息。
 
+这段对话发生在 {when}。
+
 严格输出这个 JSON 结构：
 {{
   "memories": [
@@ -44,10 +48,12 @@ _USER_TEMPLATE = """请从下面的对话里提炼值得长期记住的信息。
 
 规则：
 1. kind 只能取：fact（客观事实）、preference（用户的喜好或习惯）、event（这次发生的事）、promise（用户提到的约定或待办）
-2. text 用第三人称、以"用户"开头陈述，例如"用户下周要去上海出差三天"，一句话一条，不要多条挤在一起
+2. text 用第三人称、以"用户"开头陈述，例如"用户住在杭州"，一句话一条，不要多条挤在一起
 3. importance 取 1~5：1 无关紧要，5 非常重要
 4. 寒暄、道别、无信息量的内容不要记；没有值得记的就输出空数组
 5. summary：把下面「已有的摘要」和这次对话的新内容**合并**成一段不超过 {limit} 字的中文摘要，去掉已经无关紧要的旧内容；没有内容就留空字符串
+6. text 里不要出现"今天""明天""下周"这类会过期的说法：结合上面给出的日期换算成绝对日期再写，
+   例如"用户将于 2026-09-21 那一周去上海出差"
 
 已有的摘要（可能为空）：
 <previous>
@@ -57,6 +63,24 @@ _USER_TEMPLATE = """请从下面的对话里提炼值得长期记住的信息。
 对话：
 {transcript}
 """
+
+
+def session_when(messages) -> str:
+    """这段对话发生在什么时候，给整理提示词当日期锚点。
+
+    模型做日期算术并不可靠，所以单日会话连星期一起给出，方便把"周五之前"
+    这类说法落到具体日子上。没有这个锚点，"下周要去上海"会被原样存下来，
+    过两周就成了一条悬空的记忆。
+    """
+    stamps = [
+        moment for moment in (_parse(message.ts) for message in messages) if moment is not None
+    ]
+    if not stamps:
+        return ""
+    first, last = min(stamps), max(stamps)
+    if first.date() == last.date():
+        return f"{first:%Y-%m-%d}（{clock.WEEKDAYS[first.weekday()]}）"
+    return f"{first:%Y-%m-%d} 至 {last:%Y-%m-%d}"
 
 
 def build_transcript(messages, limit: int = MAX_TRANSCRIPT_MESSAGES) -> str:
@@ -90,10 +114,13 @@ def _coerce_importance(value) -> int:
         return 3
 
 
-def extract(provider: LLMProvider, transcript: str, previous_summary: str = "") -> tuple[list[dict], str]:
+def extract(
+    provider: LLMProvider, transcript: str, previous_summary: str = "", when: str = ""
+) -> tuple[list[dict], str]:
     """一次调用，返回 (记忆字典列表, 合并后的摘要)。"""
     prompt = _USER_TEMPLATE.format(
         limit=MAX_SUMMARY_CHARS,
+        when=when or "（时间未知）",
         previous=previous_summary or "（无）",
         transcript=transcript,
     )
@@ -127,7 +154,9 @@ def consolidate_session(
         store.clear_pending(name)
         return 0, 0
     try:
-        raw_memories, summary = extract(provider, transcript, store.summary_text())
+        raw_memories, summary = extract(
+            provider, transcript, store.summary_text(), session_when(messages)
+        )
     except ProviderError:
         # 网络失败：保留 pending，下次启动再补做
         return -1, 0

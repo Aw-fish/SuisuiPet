@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Any
 
 from app import characters
+from app.conversation import clock
 from app.conversation.message import (
     INTERRUPT_HINT,
+    NARRATION_HINT,
     Message,
     ROLE_ASSISTANT,
     ROLE_SYSTEM,
@@ -69,6 +71,11 @@ RECALL_LIMIT = 5
 RECALL_FLOOR = 0.2
 #: 判定"同一条记忆"的文本相似度阈值（字符二元组 Jaccard）
 DEDUPE_RATIO = 0.62
+#: 距上一条用户消息超过这么久，才在下一轮补一次"现在时间"旁白。
+#: 同一段对话里连着聊时模型手里的时间还够准，不必每轮都提。
+NARRATION_GAP_MINUTES = 30
+#: 记忆类内容的用途标注。常驻内容不声明用途时，模型容易把它们当成当前任务反复提起。
+BACKGROUND_LABEL = "（背景资料，只在相关时自然带出，不要主动复述）"
 
 
 def _now() -> datetime:
@@ -185,6 +192,14 @@ class RecallHit:
     entry: MemoryEntry
     score: float
     matched: list[str] = field(default_factory=list)
+
+
+def _day_suffix(entry: MemoryEntry) -> str:
+    """事件与约定补上发生日期；事实与偏好是长期属性，标时间只是噪音。"""
+    if entry.kind not in (KIND_EVENT, KIND_PROMISE):
+        return ""
+    day = clock.day_text(entry.ts)
+    return f"，{day}" if day else ""
 
 
 class MemoryStore:
@@ -648,6 +663,35 @@ class MemoryStore:
 
     # ---- L1 上下文组装 -------------------------------------------------------
 
+    def _time_narration(self, recent: list[Message]) -> str:
+        """需要给模型"对表"时返回旁白文本，否则返回空串。
+
+        为什么不把时间常驻在 system 里：
+
+        * 常驻内容会被模型当成"当前任务"，于是反复提起时间；
+        * 程序可能挂着挂机很久，system 里写死的时间会过时——这里每次发送都现算。
+
+        只给"现在"，**不给"距上次多久"**：间隔让模型自己拿记忆里的日期去推，
+        否则它容易一开口就"三天前你说过……"，变成刻意的时间观念。
+        """
+        now = _now()
+        stamps = [
+            moment
+            for moment in (_parse(message.ts) for message in recent if message.role == ROLE_USER)
+            if moment is not None
+        ]
+        if not stamps:
+            # 没有用户消息就没有可挂旁白的地方
+            return ""
+        if (
+            len(stamps) >= 2
+            and (stamps[-1] - stamps[-2]).total_seconds() < NARRATION_GAP_MINUTES * 60
+        ):
+            # 同一段对话里连着聊，模型手里的时间还够准，不必再提
+            return ""
+        # 带上"现在是"，免得模型把光秃秃的时间戳读成"这条消息发送于"
+        return f"现在是 {clock.now_text(now)}"
+
     def build_context(
         self, system_prompt: str, limit: int, query: str = ""
     ) -> list[dict[str, Any]]:
@@ -660,27 +704,37 @@ class MemoryStore:
             and (message.content.strip() or message.interrupted)
         ]
         recent = history[-max(1, limit):]
+        narration = self._time_narration(recent)
         sections: list[str] = []
         if system_prompt.strip():
             sections.append(system_prompt.strip())
+        if narration:
+            # 说明只在真的带旁白时才给：平时不花这份 token，也不给模型"时间很重要"的暗示
+            sections.append(NARRATION_HINT)
         if any(message.interrupted for message in recent):
             # 只有上下文里真的带着"被打断"的回复时才解释这个标记
             sections.append(INTERRUPT_HINT)
         profile = self.profile_text()
         if profile:
-            sections.append(f"关于用户的长期记忆：\n{profile}")
+            sections.append(f"关于用户的长期记忆{BACKGROUND_LABEL}：\n{profile}")
         hits = self.recall(query, RECALL_LIMIT) if query.strip() else []
         if hits:
-            lines = [f"- （{hit.entry.label}）{hit.entry.text}" for hit in hits]
-            sections.append("可能与当前话题相关的记忆：\n" + "\n".join(lines))
+            lines = [f"- （{hit.entry.label}{_day_suffix(hit.entry)}）{hit.entry.text}" for hit in hits]
+            sections.append(f"可能与当前话题相关的记忆{BACKGROUND_LABEL}：\n" + "\n".join(lines))
             # 被注入上下文即视为"用到了一次"，用于强化权重
             self.touch([hit.entry.id for hit in hits])
         summary = self.summary_text()
         if summary:
-            sections.append(f"更早的对话摘要：\n{summary}")
+            sections.append(f"更早的对话摘要{BACKGROUND_LABEL}：\n{summary}")
         context: list[dict[str, Any]] = []
         if sections:
             context.append({"role": ROLE_SYSTEM, "content": "\n\n".join(sections)})
-        for message in recent:
-            context.append(message.to_api())
+        # 旁白挂在最后一条用户消息前面：模型会把它读成"这句话的背景"，
+        # 而不是一条需要单独回应的内容。
+        latest_user = next(
+            (index for index in range(len(recent) - 1, -1, -1) if recent[index].role == ROLE_USER),
+            -1,
+        )
+        for index, message in enumerate(recent):
+            context.append(message.to_api(narration if index == latest_user else ""))
         return context
