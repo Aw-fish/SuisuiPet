@@ -170,7 +170,7 @@ class ChatInput(QTextEdit):
 
 
 class ChatDialog(QDialog):
-    """流式对话窗：中途可停止、支持历史恢复，生成时联动桌宠的说话动作。"""
+    """流式对话窗：中途可停止、支持历史恢复，生成时联动桌宠的动作。"""
 
     def __init__(self, parent: QWidget, conversation: ConversationService) -> None:
         super().__init__(parent)
@@ -389,7 +389,8 @@ class ChatDialog(QDialog):
                     label.setText(final)
                 label.setFixedWidth(self._bubble_width(label, final))
             elif not label.text():
-                label.setText("（没有内容）")
+                # 一个字都没生成（比如刚发出就被打断）：留个省略号，比"（没有内容）"自然
+                label.setText("...")
                 label.setFixedWidth(self._bubble_width(label, label.text()))
         self.status.setText("")
         # 一条完整回复落地，等同于来了一条新消息，直接跳到底部
@@ -523,12 +524,12 @@ class PetCanvas(QWidget):
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
         self.animation = QPropertyAnimation(self, b'pos', self); self.animation.finished.connect(self._on_wander_finished)
-        self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy)
+        self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy); self.conversation.reasoning_changed.connect(self._on_reasoning_changed)
         self.conversation.consolidated.connect(self._on_consolidated)
         self.conversation.mood_changed.connect(self._on_mood_changed)
         self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place()
@@ -566,8 +567,18 @@ class PetWindow(QWidget):
         self.chat.set_title(name)
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
     def _on_conversation_busy(self, busy: bool) -> None:
-        if busy: self.canvas.set_state('Talk')
-        else: self._restore_state()
+        # 刚发出消息、还一个分片都没到的时候，先按"思考"处理
+        if busy: self._reasoning = True; self.canvas.set_state('Think')
+        else: self._reasoning = False; self._restore_state()
+    def _on_reasoning_changed(self, reasoning: bool) -> None:
+        """收到推理内容 = 模型还在想；正文开始流 = 模型开始说。
+
+        推理模型可能几十秒只吐 reasoning_content，这段时间立绘一直"思考"；
+        正文一出来就切成说话动作——看一眼动作就知道模型在想还是在说。
+        """
+        if not self.conversation.busy: return
+        self._reasoning = reasoning
+        self.canvas.set_state('Think' if reasoning else 'Talk')
     def begin_new_session(self) -> None:
         """启动时开一段全新会话：历史靠长期记忆承载，对话窗从空开始。"""
         self.conversation.start_new_session(); self.chat.load_history([])
@@ -681,6 +692,8 @@ class PetWindow(QWidget):
         if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.canvas.set_state('Idle'); self.say('专注完成！',5000)
     def _wander(self)->None:
         if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
+        # 推理期间不随机移动：一走路，思考动作就被 Move 素材盖住了
+        if self._reasoning: return
         _, chance, distance = motion_profile(self.activity)
         if self._mood_state is not None: chance *= MOOD_MOVE_DAMPING
         if random.random()>chance: return

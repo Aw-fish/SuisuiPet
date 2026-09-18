@@ -23,6 +23,7 @@ from typing import Any
 
 from app import characters
 from app.conversation.message import (
+    INTERRUPT_HINT,
     Message,
     ROLE_ASSISTANT,
     ROLE_SYSTEM,
@@ -650,9 +651,21 @@ class MemoryStore:
     def build_context(
         self, system_prompt: str, limit: int, query: str = ""
     ) -> list[dict[str, Any]]:
+        # 被打断的回复即便一个字都没生成也要留下：它在上下文里会带上 INTERRUPT_MARK，
+        # 让模型知道自己上次被掐断了，而不是以为那轮什么都没说。
+        history = [
+            message
+            for message in self.load()
+            if message.role in (ROLE_USER, ROLE_ASSISTANT)
+            and (message.content.strip() or message.interrupted)
+        ]
+        recent = history[-max(1, limit):]
         sections: list[str] = []
         if system_prompt.strip():
             sections.append(system_prompt.strip())
+        if any(message.interrupted for message in recent):
+            # 只有上下文里真的带着"被打断"的回复时才解释这个标记
+            sections.append(INTERRUPT_HINT)
         profile = self.profile_text()
         if profile:
             sections.append(f"关于用户的长期记忆：\n{profile}")
@@ -668,11 +681,6 @@ class MemoryStore:
         context: list[dict[str, Any]] = []
         if sections:
             context.append({"role": ROLE_SYSTEM, "content": "\n\n".join(sections)})
-        history = [
-            message
-            for message in self.load()
-            if message.role in (ROLE_USER, ROLE_ASSISTANT) and message.content.strip()
-        ]
-        for message in history[-max(1, limit):]:
+        for message in recent:
             context.append(message.to_api())
         return context

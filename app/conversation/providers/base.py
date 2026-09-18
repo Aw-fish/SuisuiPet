@@ -22,9 +22,12 @@ class ToolCall:
 
 @dataclass
 class Chunk:
-    """一次流式增量：要么是文本片段，要么是收尾时的工具调用汇总。"""
+    """一次流式增量：正文片段、推理片段，或收尾时的工具调用汇总。"""
 
     delta: str = ""
+    #: 推理模型的思考内容（OpenAI 兼容接口里的 ``reasoning_content``）。
+    #: 不进正文、也不显示，只当作"模型还在推理"的信号。
+    reasoning: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finished: bool = False
 

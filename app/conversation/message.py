@@ -11,6 +11,17 @@ ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
 ROLE_TOOL = "tool"
 
+#: 回复被打断时追加到 assistant 内容末尾的标记，让模型知道自己被切断了。
+#: 只加在**发给模型的上下文**里（见 :meth:`Message.to_api`），落盘与界面都保留干净正文。
+INTERRUPT_MARK = "[被打断]"
+
+#: 上下文里真的出现被打断的回复时，才解释这个标记——没被打断就不花这份 token
+INTERRUPT_HINT = (
+    f"若你上一轮回复的末尾出现 {INTERRUPT_MARK}，表示用户当时打断了你，"
+    "那不是一句完整的话。可以顺着被打断的地方接着说，也可以直接回应用户的新消息，"
+    "但不要重复已经说过的内容，也不要假装那句话已经说完了。"
+)
+
 
 def now_stamp() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -26,8 +37,15 @@ class Message:
     tool_call_id: str = ""
 
     def to_api(self) -> dict[str, Any]:
-        """转成 OpenAI 兼容接口的 message 格式。"""
-        payload: dict[str, Any] = {"role": self.role, "content": self.content}
+        """转成 OpenAI 兼容接口的 message 格式。
+
+        被打断的回复会在末尾补上 ``INTERRUPT_MARK``：模型拿到的是"说到一半就被掐了"
+        的上下文，而不是一句看起来已经说完的话。
+        """
+        content = self.content
+        if self.interrupted:
+            content = f"{content}{INTERRUPT_MARK}" if content.strip() else INTERRUPT_MARK
+        payload: dict[str, Any] = {"role": self.role, "content": content}
         if self.tool_calls:
             payload["tool_calls"] = self.tool_calls
         if self.tool_call_id:

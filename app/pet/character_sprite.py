@@ -38,11 +38,14 @@ FALLBACKS: dict[str, tuple[str, ...]] = {
     "Talk": ("Talk", "Idle", DEFAULT_NAME),
     "Focus": ("Focus", "Idle", DEFAULT_NAME),
     "Drag": ("Drag", "Idle", DEFAULT_NAME),
+    # Think 两种身份都担：既能当表情固定，也当动作状态用在"生成回复 / 打字"时。
+    # 它不是必需素材，没有时回落到 Idle，别让角色僵在 Default 上。
+    "Think": ("Think", "Idle", DEFAULT_NAME),
 }
 
 #: 扁平命名没有 manifest 承载帧率，播放速度集中定义在这里。
 #: 表情等未列出的动作走 DEFAULT_FPS。
-FPS: dict[str, int] = {"Idle": 4, "Move": 8, "Talk": 7, "Focus": 3, "Drag": 6}
+FPS: dict[str, int] = {"Idle": 4, "Move": 8, "Talk": 7, "Focus": 3, "Drag": 6, "Think": 5}
 DEFAULT_FPS = 5
 
 

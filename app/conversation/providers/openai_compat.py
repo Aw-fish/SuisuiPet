@@ -198,6 +198,9 @@ class OpenAICompatProvider:
 
     def _iter_chunks(self, response: requests.Response, cancel: threading.Event | None) -> Iterator[Chunk]:
         pending: dict[int, dict[str, str]] = {}
+        # 请求刚发出就被打断时，没必要再等第一行数据
+        if cancel is not None and cancel.is_set():
+            return
         for raw in response.iter_lines(decode_unicode=True):
             if cancel is not None and cancel.is_set():
                 return
@@ -218,6 +221,11 @@ class OpenAICompatProvider:
                 continue
             delta = choices[0].get("delta") or {}
             self._collect_tool_calls(delta.get("tool_calls"), pending)
+            # 推理模型（如 deepseek-flash）会先流式吐 reasoning_content，
+            # 这段时间一个正文字都没有，交给上层当作"正在推理"的信号。
+            reasoning = delta.get("reasoning_content") or ""
+            if reasoning:
+                yield Chunk(reasoning=str(reasoning))
             text = delta.get("content") or ""
             if text:
                 yield Chunk(delta=text)

@@ -75,6 +75,8 @@ class _StreamWorker(QThread):
     """在工作线程里跑一次流式请求。"""
 
     delta = Signal(str)
+    #: True = 收到推理内容（还在想），False = 正文开始了（开始说）
+    reasoning_changed = Signal(bool)
     finished = Signal(str)
     failed = Signal(str)
 
@@ -94,18 +96,37 @@ class _StreamWorker(QThread):
 
     def run(self) -> None:
         parts: list[str] = []
+        error = ""
+        reasoning = False
+        speaking = False
         try:
             for chunk in self._provider.stream(self._messages, cancel=self._cancel):
                 if self._cancel.is_set():
                     break
+                # 只在状态真的翻转时发信号：推理片段动辄上千个，逐个发会淹掉主线程
+                if chunk.reasoning and not reasoning:
+                    reasoning = True
+                    speaking = False
+                    self.reasoning_changed.emit(True)
                 if chunk.delta:
+                    # 没有推理阶段的模型直接进正文，这里同样要通知一次（转成"说话"）
+                    if not speaking:
+                        speaking = True
+                        reasoning = False
+                        self.reasoning_changed.emit(False)
                     parts.append(chunk.delta)
                     self.delta.emit(chunk.delta)
         except ProviderError as exc:
-            self.failed.emit(str(exc))
-            return
+            error = str(exc)
         except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
-            self.failed.emit(f"请求出错：{exc}")
+            error = f"请求出错：{exc}"
+        # 主动打断会把阻塞中的连接掐断，读取随之抛异常——那是预期行为，不是失败。
+        # 这里一律按正常结束交回去，由上层以「被打断」收尾并保留已生成的部分。
+        if self._cancel.is_set():
+            self.finished.emit("".join(parts))
+            return
+        if error:
+            self.failed.emit(error)
             return
         self.finished.emit("".join(parts))
 
@@ -143,6 +164,8 @@ class ConversationService(QObject):
     finished = Signal(str)
     failed = Signal(str)
     busy_changed = Signal(bool)
+    #: True = 模型还在推理（只吐 reasoning_content），False = 正文开始流出来了
+    reasoning_changed = Signal(bool)
     consolidated = Signal(int, int)
     consolidation_failed = Signal(str)
     #: 回复里标出的表情（立绘素材名，None 表示回到默认立绘）
@@ -257,6 +280,8 @@ class ConversationService(QObject):
         self._splitter.reset()
         worker = _StreamWorker(provider, messages, self)
         worker.delta.connect(self._on_delta)
+        # 推理状态不需要加工，直接转发给界面
+        worker.reasoning_changed.connect(self.reasoning_changed)
         worker.finished.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(worker.deleteLater)
@@ -293,6 +318,11 @@ class ConversationService(QObject):
         self._finalize("".join(self._clean))
 
     def _on_failed(self, message: str) -> None:
+        worker = self._worker
+        if worker is not None and worker.cancelled:
+            # 打断过程中冒出来的读取异常：按「被打断」收尾，别丢掉已经生成的内容
+            self._finalize("".join(self._clean))
+            return
         self._finalize("", error=message)
 
     def _finalize(self, text: str, error: str = "") -> None:
