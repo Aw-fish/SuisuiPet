@@ -19,10 +19,10 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-from app import characters
-from app.conversation import clock
+from app import characters, devtools
+from app.conversation import clock, prompts
 from app.conversation.message import (
     INTERRUPT_HINT,
     NARRATION_HINT,
@@ -693,7 +693,11 @@ class MemoryStore:
         return f"现在是 {clock.now_text(now)}"
 
     def build_context(
-        self, system_prompt: str, limit: int, query: str = ""
+        self,
+        system_prompt: str,
+        limit: int,
+        query: str = "",
+        notes: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
         # 被打断的回复即便一个字都没生成也要留下：它在上下文里会带上 INTERRUPT_MARK，
         # 让模型知道自己上次被掐断了，而不是以为那轮什么都没说。
@@ -708,24 +712,28 @@ class MemoryStore:
         sections: list[str] = []
         if system_prompt.strip():
             sections.append(system_prompt.strip())
+        # 表情标记（service 传进来的运行期说明）与对话背景说明合成同一节：
+        # 两块各自按条件出现——没开自动表情 / 本次不带对话背景时，都不花这份 token
+        marks = [str(note).strip() for note in notes if str(note).strip()]
         if narration:
-            # 说明只在真的带旁白时才给：平时不花这份 token，也不给模型"时间很重要"的暗示
-            sections.append(NARRATION_HINT)
+            marks.append(NARRATION_HINT)
+        if marks:
+            sections.append(f"{prompts.MARKS}\n" + "\n".join(marks))
         if any(message.interrupted for message in recent):
             # 只有上下文里真的带着"被打断"的回复时才解释这个标记
-            sections.append(INTERRUPT_HINT)
+            sections.append(f"{prompts.INTERRUPT}\n{INTERRUPT_HINT}")
         profile = self.profile_text()
         if profile:
-            sections.append(f"关于用户的长期记忆{BACKGROUND_LABEL}：\n{profile}")
+            sections.append(f"{prompts.PROFILE}{BACKGROUND_LABEL}\n{profile}")
         hits = self.recall(query, RECALL_LIMIT) if query.strip() else []
         if hits:
             lines = [f"- （{hit.entry.label}{_day_suffix(hit.entry)}）{hit.entry.text}" for hit in hits]
-            sections.append(f"可能与当前话题相关的记忆{BACKGROUND_LABEL}：\n" + "\n".join(lines))
+            sections.append(f"{prompts.RECALL}{BACKGROUND_LABEL}\n" + "\n".join(lines))
             # 被注入上下文即视为"用到了一次"，用于强化权重
             self.touch([hit.entry.id for hit in hits])
         summary = self.summary_text()
         if summary:
-            sections.append(f"更早的对话摘要{BACKGROUND_LABEL}：\n{summary}")
+            sections.append(f"{prompts.SUMMARY}{BACKGROUND_LABEL}\n{summary}")
         context: list[dict[str, Any]] = []
         if sections:
             context.append({"role": ROLE_SYSTEM, "content": "\n\n".join(sections)})
@@ -737,4 +745,21 @@ class MemoryStore:
         )
         for index, message in enumerate(recent):
             context.append(message.to_api(narration if index == latest_user else ""))
+        # 交给开发者面板：它要能看到这次到底拼了什么（含旁白、系统段、每轮的时间）
+        devtools.record(
+            "context",
+            character=self.character,
+            query=query,
+            narration=narration,
+            sections=list(sections),
+            turns=[
+                {
+                    "role": message.role,
+                    "ts": message.ts,
+                    "interrupted": message.interrupted,
+                    "content": message.content,
+                }
+                for message in recent
+            ],
+        )
         return context

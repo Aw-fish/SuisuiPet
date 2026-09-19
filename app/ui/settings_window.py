@@ -12,10 +12,11 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
     QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
 )
-from app import characters
+from app import characters, devtools
 from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.conversation.service import check_connection
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
+from app.ui.dev_window import DevWindow
 from app.ui.dialogs import StyledDialog
 from app.ui.icons import app_icon
 from app.ui.memory_window import MemoryWindow
@@ -123,6 +124,7 @@ class SettingsWindow(QMainWindow):
         self._active_character: str | None = None
         self._character_cache: dict[str, dict] = {}
         self._memory_window: MemoryWindow | None = None
+        self._dev_window: DevWindow | None = None
         self._test_worker: _ConnectWorker | None = None
         # 拦截器必须被持有，否则会被 Python 回收导致失效
         self._wheel_guards: list[_WheelGuard] = []
@@ -153,7 +155,7 @@ class SettingsWindow(QMainWindow):
         nav.addSpacing(24)
         self.stack = QStackedWidget()
         self.group = QButtonGroup(self)
-        for i, title in enumerate(("角色设置", "模式设置", "工具")):
+        for i, title in enumerate(("角色设置", "模式设置", "工具", "开发者")):
             button = QPushButton(title, objectName="nav")
             button.setCheckable(True)
             button.clicked.connect(lambda checked=False, index=i: self.show_page(index))
@@ -176,6 +178,7 @@ class SettingsWindow(QMainWindow):
         self.stack.addWidget(self._character_page())
         self.stack.addWidget(self._mode_page())
         self.stack.addWidget(self._tools_page())
+        self.stack.addWidget(self._developer_page())
         content_layout.addWidget(self.stack, 1)
         save = QPushButton("保存设置", objectName="save")
         save.clicked.connect(self.save)
@@ -218,7 +221,7 @@ class SettingsWindow(QMainWindow):
         return QLabel(text, objectName="label")
 
     def _character_page(self) -> QWidget:
-        page, layout = self._page("角色设置", "每个角色拥有独立文件夹，包含立绘、对话配置与记忆。")
+        page, layout = self._page("角色设置", "每个角色存储在独立文件夹，包含立绘、对话配置与记忆。")
         layout.addWidget(self._label("角色选择"))
         picker = QHBoxLayout()
         picker.setSpacing(8)
@@ -289,7 +292,7 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self.model)
         layout.addWidget(self._label("API 地址"))
         self.base_url = QLineEdit()
-        self.base_url.setPlaceholderText("例如：https://api.deepseek.com/v1")
+        self.base_url.setPlaceholderText("例如：https://api.deepseek.com")
         layout.addWidget(self.base_url)
         layout.addWidget(self._label("代理（可留空）"))
         self.proxy = QLineEdit()
@@ -320,7 +323,7 @@ class SettingsWindow(QMainWindow):
         layout.addLayout(params)
         layout.addWidget(self._label("角色提示词"))
         self.prompt = GrowingTextEdit(CHARACTER_PROMPT_HEIGHT, BASE_PROMPT_HEIGHT)
-        self.prompt.setPlaceholderText("描述角色的性格、语气与对话边界……")
+        self.prompt.setPlaceholderText("描述角色的人设性格、语气与对话边界……")
         layout.addWidget(self.prompt)
         test_row = QHBoxLayout()
         test_row.setSpacing(10)
@@ -341,7 +344,7 @@ class SettingsWindow(QMainWindow):
         self.sensitivity_value.setText(f"{value} / 10")
         dwell_ms, timeout_ms = mood_timing(value)
         self.sensitivity_hint.setText(
-            f"越大切换越跟手：最短停留 {dwell_ms / 1000:g} 秒，"
+            f"参数越高，表情切换越快：最短停留 {dwell_ms / 1000:g} 秒，"
             f"{timeout_ms // 60000} 分钟没有新情绪就回到默认立绘。"
         )
 
@@ -362,7 +365,7 @@ class SettingsWindow(QMainWindow):
         self.auto_expression.setToolTip("开启后提示词里会追加表情标记说明，模型在回复中标出的表情会切换立绘")
         self.auto_expression.toggled.connect(self._on_auto_expression_toggled)
         layout.addWidget(self.auto_expression)
-        layout.addWidget(QLabel("关闭后不再注入表情说明，也省下这段 token。", objectName="hint"))
+        layout.addWidget(QLabel("关闭后不再注入表情说明，节省部分token。", objectName="hint"))
         layout.addWidget(self._label("表情切换灵敏度"))
         sensitivity_row = QHBoxLayout()
         sensitivity_row.setSpacing(10)
@@ -382,7 +385,7 @@ class SettingsWindow(QMainWindow):
         self.sensitivity_hint.setWordWrap(True)
         layout.addWidget(self.sensitivity_hint)
         layout.addSpacing(20)
-        layout.addWidget(self._label("基础提示词（对所有角色生效）"))
+        layout.addWidget(self._label("全局提示词（对所有角色生效）"))
         self.base_prompt = QTextEdit()
         self.base_prompt.setFixedHeight(BASE_PROMPT_HEIGHT)
         self.base_prompt.setPlaceholderText("约束整体说话风格，例如回复长度、语气与格式……")
@@ -394,7 +397,7 @@ class SettingsWindow(QMainWindow):
         self.reset_prompt.clicked.connect(self._reset_base_prompt)
         prompt_row.addWidget(self.reset_prompt)
         prompt_row.addWidget(
-            QLabel("会拼在「角色设置 → 角色提示词」前面一起发给模型。", objectName="hint"), 1
+            QLabel("系统提示词包含[全局提示词]、[角色提示词]与其他设置", objectName="hint"), 1
         )
         layout.addLayout(prompt_row)
         layout.addStretch()
@@ -414,6 +417,54 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self.city)
         layout.addStretch()
         return page
+
+    def _developer_page(self) -> QWidget:
+        page, layout = self._page("开发者", "调试用的观察窗口：看模型实际收到了什么，以及程序正在做什么。")
+        self.developer_enabled = QCheckBox("启用开发者面板")
+        self.developer_enabled.toggled.connect(self._on_developer_toggled)
+        layout.addWidget(self.developer_enabled)
+        layout.addWidget(
+            QLabel(
+                "开启后立即开始记录，并直接弹出面板，不必先保存设置。",
+                objectName="hint",
+            )
+        )
+        layout.addSpacing(14)
+        layout.addWidget(self._label("面板里能看到什么"))
+        for line in (
+            "· 每次请求拼出的完整上下文：系统段逐段列出，对话背景、每一轮消息的角色与时间都在；",
+            "· 实发条数与总字数、模型与温度、首字延迟与总耗时、是否被打断；",
+            "· 运行日志：发请求、打断、请求失败、记忆整理的结果都会记一行。",
+        ):
+            hint = QLabel(line, objectName="hint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+        layout.addSpacing(14)
+        self.developer_open = QPushButton("打开开发者面板", objectName="mini")
+        self.developer_open.setEnabled(False)
+        self.developer_open.clicked.connect(self._open_dev_window)
+        layout.addWidget(self.developer_open, alignment=Qt.AlignLeft)
+        layout.addWidget(
+            QLabel("记录只放在内存里、不写文件（上限 500 条），关掉开关即清空。", objectName="hint")
+        )
+        layout.addStretch()
+        return page
+
+    def _on_developer_toggled(self, checked: bool) -> None:
+        """开关立即生效，并顺手把面板打开 / 收起。"""
+        devtools.set_enabled(checked)
+        self.developer_open.setEnabled(checked)
+        if checked:
+            self._open_dev_window()
+        elif self._dev_window is not None:
+            self._dev_window.hide()
+
+    def _open_dev_window(self) -> None:
+        if self._dev_window is None:
+            self._dev_window = DevWindow(self)
+        self._dev_window.show()
+        self._dev_window.raise_()
+        self._dev_window.activateWindow()
 
     # ---- 角色目录与配置 ----------------------------------------------------
 
@@ -577,7 +628,7 @@ class SettingsWindow(QMainWindow):
             self,
             "添加角色",
             "为新角色创建一个独立文件夹，立绘、对话配置与记忆都会放在里面。",
-            placeholder="例如：Suisui",
+            placeholder="请输入角色名称",
         )
         if name is None:
             return
@@ -670,6 +721,13 @@ class SettingsWindow(QMainWindow):
         self._on_sensitivity_changed(self.expression_sensitivity.value())
         self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
+        # 开发者开关：这里只同步界面，真正开启由 PetWindow 按同样的设置执行，
+        # 免得"启动时看到开关是开的"就顺手把面板弹出来
+        enabled = bool(self.data.get("developer", {}).get("enabled", False))
+        self.developer_enabled.blockSignals(True)
+        self.developer_enabled.setChecked(enabled)
+        self.developer_enabled.blockSignals(False)
+        self.developer_open.setEnabled(enabled)
 
     def save(self) -> None:
         name = self._active_character or self.data["character"]["selected"]
@@ -686,6 +744,7 @@ class SettingsWindow(QMainWindow):
         self.data["conversation"]["expression_sensitivity"] = self.expression_sensitivity.value()
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
+        self.data.setdefault("developer", {})["enabled"] = self.developer_enabled.isChecked()
         self._flush_characters()
         save_settings(self.data)
         self.settings_saved.emit(self.data)

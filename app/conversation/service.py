@@ -11,10 +11,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Sequence
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from app import devtools
+from app.conversation import prompts
 from app.conversation.consolidation import consolidate_pending
 from app.conversation.memory import MemoryStore
 from app.conversation.message import Message, ROLE_ASSISTANT, ROLE_USER
@@ -183,6 +186,9 @@ class ConversationService(QObject):
         self._tag_filter = TagFilter()
         self._clean: list[str] = []
         self._auto_expression = False
+        #: 本次请求的时间基准，用来算首字延迟与总耗时（只给开发者面板看）
+        self._started_at: float | None = None
+        self._first_delta_at: float | None = None
 
     # ---- 配置 ---------------------------------------------------------------
 
@@ -250,9 +256,12 @@ class ConversationService(QObject):
         worker.start()
 
     def _on_consolidated(self, added: int, merged: int) -> None:
+        devtools.log.info("记忆 · 整理完成：新增 %d 条，合并 %d 条", added, merged)
+        devtools.record("consolidated", added=added, merged=merged)
         self.consolidated.emit(added, merged)
 
     def _on_consolidation_failed(self, message: str) -> None:
+        devtools.log.warning("记忆 · 整理失败：%s", message)
         self.consolidation_failed.emit(message)
 
     def _on_consolidation_finished(self) -> None:
@@ -270,13 +279,33 @@ class ConversationService(QObject):
             return
         provider = build_provider(self._info)
         if provider is None:
+            devtools.log.warning("对话 · 无法发送：没有配置 API 地址或模型名称")
             self.failed.emit("没有配置 API 地址或模型名称，请到设置 → 角色设置里填写")
             return
         self._tag_filter.reset()
         self._clean.clear()
         self._memory.append(Message(role=ROLE_USER, content=text))
         # 把用户这句话交给记忆检索，召回与当前话题相关的长期记忆
-        messages = self._memory.build_context(self._system_prompt(), self._context_limit(), text)
+        messages = self._memory.build_context(
+            self._system_prompt(), self._context_limit(), text, self._runtime_notes()
+        )
+        self._started_at = time.monotonic()
+        self._first_delta_at = None
+        devtools.record(
+            "request",
+            character=self._character,
+            model=str(self._info.get("model", "")),
+            temperature=self._info.get("temperature"),
+            context_limit=self._context_limit(),
+            count=len(messages),
+            chars=sum(len(str(item.get("content", ""))) for item in messages),
+        )
+        devtools.log.info(
+            "对话 · 发出请求（%s，上下文 %d 条 / %d 字）",
+            self._character or "未选角色",
+            len(messages),
+            sum(len(str(item.get("content", ""))) for item in messages),
+        )
         self._splitter.reset()
         worker = _StreamWorker(provider, messages, self)
         worker.delta.connect(self._on_delta)
@@ -294,11 +323,14 @@ class ConversationService(QObject):
         """打断当前生成；已生成的部分会保留并标记 interrupted。"""
         worker = self._worker
         if worker is not None:
+            devtools.log.info("对话 · 打断生成")
             worker.cancel()
 
     # ---- 内部 ---------------------------------------------------------------
 
     def _on_delta(self, text: str) -> None:
+        if self._first_delta_at is None:
+            self._first_delta_at = time.monotonic()
         # 先在流上剥掉情绪标记，下游（界面 / 落盘 / 句级切分）拿到的都是干净正文
         clean, tags = self._tag_filter.feed(text)
         for tag in tags:
@@ -333,6 +365,31 @@ class ConversationService(QObject):
             self._memory.append(
                 Message(role=ROLE_ASSISTANT, content=text, interrupted=interrupted)
             )
+        first = total = 0.0
+        if self._started_at is not None:
+            total = time.monotonic() - self._started_at
+            if self._first_delta_at is not None:
+                first = self._first_delta_at - self._started_at
+        self._started_at = None
+        self._first_delta_at = None
+        devtools.record(
+            "reply",
+            text=text,
+            interrupted=interrupted,
+            error=error,
+            first_token_ms=round(first * 1000),
+            total_ms=round(total * 1000),
+        )
+        if error:
+            devtools.log.warning("对话 · 请求失败：%s", error)
+        else:
+            devtools.log.info(
+                "对话 · 回复完成（用时 %.2fs，首字 %.2fs，%d 字%s）",
+                total,
+                first,
+                len(text),
+                "，被打断" if interrupted else "",
+            )
         self.busy_changed.emit(False)
         if error:
             self.failed.emit(error)
@@ -340,15 +397,24 @@ class ConversationService(QObject):
             self.finished.emit(text)
 
     def _system_prompt(self) -> str:
-        """通用的说话约束在前，角色自己的设定在后，两者拼成一条 system。"""
-        parts = [
-            str(self._base_prompt).strip(),
-            str(self._info.get("system_prompt", "")).strip(),
-        ]
-        if self._auto_expression:
-            # 只在开启自动表情时才追加，关掉就省下这段 token
-            parts.append(EXPRESSION_HINT)
-        return "\n\n".join(part for part in parts if part)
+        """拼成一条 system：每块前面都带一个大标题（见 app/conversation/prompts.py）。
+
+        顺序是"通用约束 → 角色人设"：先定基调，再定人设。表情标记这类运行期说明
+        交给 :meth:`_runtime_notes`，由 build_context 与对话背景说明合成同一节。
+        """
+        parts: list[str] = []
+        base = str(self._base_prompt).strip()
+        if base:
+            parts.append(f"{prompts.BASIC}\n{base}")
+        persona = str(self._info.get("system_prompt", "")).strip()
+        if persona:
+            parts.append(f"{prompts.PERSONA}\n{persona}")
+        return "\n\n".join(parts)
+
+    def _runtime_notes(self) -> list[str]:
+        """运行期要额外告诉模型的说明，逐条传给 build_context 合并成【标记说明】。"""
+        # 只在开启自动表情时才给，关掉就省下这段 token
+        return [EXPRESSION_HINT] if self._auto_expression else []
 
     def _context_limit(self) -> int:
         try:

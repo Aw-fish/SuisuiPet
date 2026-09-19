@@ -8,7 +8,7 @@ from typing import Callable
 from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
-from app import characters
+from app import characters, devtools
 from app.config import load_settings, save_settings
 from app.conversation.message import ROLE_ASSISTANT, ROLE_USER
 from app.conversation.service import ConversationService
@@ -563,6 +563,8 @@ class PetWindow(QWidget):
             bool(data.get('conversation', {}).get('auto_expression', True)),
             data.get('conversation', {}).get('expression_sensitivity', DEFAULT_SENSITIVITY),
         )
+        # 开发者面板的开关跟随设置（启动、换角色、保存设置都会走到这里）
+        devtools.set_enabled(bool(data.get("developer", {}).get("enabled", False)))
         self.conversation.configure(name, info, data.get("conversation", {}).get("base_prompt", ""))
         self.chat.set_title(name)
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))

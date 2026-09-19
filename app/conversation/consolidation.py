@@ -30,7 +30,7 @@ MAX_TRANSCRIPT_MESSAGES = 40
 MAX_SUMMARY_CHARS = 300
 
 _SYSTEM = (
-    "你在分析一段用户与桌面宠物的对话，负责提炼值得长期记住的信息。"
+    "你在分析一段角色与用户的对话，负责提炼值得长期记住的信息。"
     "只输出一个 JSON 对象，不要任何解释、前后缀或 Markdown 代码块。"
 )
 

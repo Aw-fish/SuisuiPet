@@ -3,7 +3,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from app import characters
+from app import characters, devtools
 from app.config import load_settings
 from app.ui.icons import app_icon
 from app.ui.pet_window import PetWindow
@@ -14,6 +14,9 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(app_icon())
+    # 日志同时写控制台与开发者面板（面板开关另由设置决定）
+    devtools.configure_logging()
+    devtools.log.info("启动 SuisuiPet")
     # 保证当前角色的文件夹存在（幂等，只在启动时跑一次）
     _ = characters.ensure_character(load_settings()["character"]["selected"])
     settings = SettingsWindow()
