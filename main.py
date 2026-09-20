@@ -20,7 +20,7 @@ def main() -> None:
     # 保证当前角色的文件夹存在（幂等，只在启动时跑一次）
     _ = characters.ensure_character(load_settings()["character"]["selected"])
     settings = SettingsWindow()
-    pet = PetWindow(settings.show_from_tray, settings.apply_external_settings)
+    pet = PetWindow(settings.show_from_tray, settings.apply_external_settings, settings.notify)
     settings.settings_saved.connect(pet.apply_settings)
     settings.memory_reset.connect(pet.reset_memory)
     # 重启即全新会话：历史由长期记忆承载；同时后台补做上次没整理完的会话

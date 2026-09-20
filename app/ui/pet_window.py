@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Callable
 from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QContextMenuEvent, QFontMetrics, QMouseEvent, QPainter, QPixmap
+from PySide6.QtGui import QActionGroup, QContextMenuEvent, QCursor, QFontMetrics, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 from app import characters, devtools
 from app.config import load_settings, save_settings
@@ -44,11 +44,25 @@ ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
 #: 随机移动按这张表决定镜像；拖拽沿用"向左即镜像"的写法。
 ART_FACES_LEFT = True
 
-#: 随机移动的恒定速度（像素/秒）。动画时长由距离换算而来，
+#: 移动的恒定速度（像素/秒），随机游走与跟随鼠标共用。动画时长由距离换算而来，
 #: 所以走得远近只影响走多久，不影响走多快。
-MOVE_SPEED = 130
+MOVE_SPEED = 160
 #: 单次移动的时长上下限，避免极短距离一闪而过、极长距离磨磨蹭蹭
 MOVE_MIN_MS, MOVE_MAX_MS = 260, 2600
+
+#: 跟随鼠标：多久看一眼鼠标在哪（毫秒）
+FOLLOW_TICK_MS = 120
+#: 跟随鼠标：一步最多走这么久，走完重新看一眼鼠标在哪。
+#: 时长按 MOVE_SPEED 折算成距离，所以速度仍是那个恒定值，只是会不时修正方向。
+FOLLOW_STEP_MS = 900
+#: 跟随鼠标：停下来时离鼠标的余量（像素）。实际距离取窗口半对角线 + 这个余量，
+#: 这样不管从哪个方向靠近，停下时鼠标一定在窗口之外——不压鼠标，也就不挡点击。
+FOLLOW_MARGIN = 36
+
+#: 气泡与"思考"动作的停留时长。切换模型 / 模式 / 表情 / 番茄钟这类状态提示都用它——
+#: 它们只是"我知道了"，是原来时长的一半，不必一直挡在那；要看清的（任务完成）在调用处
+#: 显式给更长的值。
+SAY_MS = 1150
 
 #: 身上带着情绪表情时，随机移动的概率乘以这个系数。
 #: 表情只在待机时露脸，一走起来就被 Move 素材盖住了，所以有表情时让它多待一会儿
@@ -172,7 +186,9 @@ class ChatInput(QTextEdit):
 class ChatDialog(QDialog):
     """流式对话窗：中途可停止、支持历史恢复，生成时联动桌宠的动作。"""
 
-    def __init__(self, parent: QWidget, conversation: ConversationService) -> None:
+    def __init__(self, parent: QWidget | None, conversation: ConversationService) -> None:
+        # 刻意不认桌宠当 parent：Qt 里"子窗口永远浮在父窗口之上"，认了之后对话窗
+        # 就会一直压住桌宠。传 None，把最上层留给桌宠。
         super().__init__(parent)
         self.conversation = conversation
         self.drag: QPoint | None = None
@@ -456,14 +472,25 @@ CHAT_QSS = (
 
 
 class TimerWindow(QWidget):
-    def __init__(self, pet: QWidget, stop: Callable[[], None]) -> None:
-        super().__init__(); self.pet = pet; self.setFixedSize(150, 62); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
-        root = QFrame(objectName="timerRoot"); layout = QHBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(root); inner = QHBoxLayout(root); inner.setContentsMargins(12, 8, 10, 8)
-        self.label = QLabel("25:00", objectName="timerLabel"); button = QPushButton("停止", objectName="stop"); button.clicked.connect(stop); inner.addWidget(self.label, 1); inner.addWidget(button)
-        self.setStyleSheet('QFrame#timerRoot { background:rgba(255,255,255,235); border:1px solid #E8E4F2; border-radius:14px; } QLabel#timerLabel { color:#5C5275; font-weight:600; } QPushButton#stop { background:#F2EFF9; color:#73688F; border:0; border-radius:8px; padding:6px 9px; }')
+    def __init__(self, pet: QWidget, pause: Callable[[], None], reset: Callable[[], None], stop: Callable[[], None]) -> None:
+        # 不设 WindowStaysOnTopHint：置顶只留给桌宠。两个都置顶时，后弹出来的浮窗
+        # 会盖住桌宠（同层级里后 raise 的在上）。
+        super().__init__(); self.pet = pet; self.setFixedSize(212, 62); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool); self.setAttribute(Qt.WA_TranslucentBackground)
+        root = QFrame(objectName="timerRoot"); layout = QHBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(root); inner = QHBoxLayout(root); inner.setContentsMargins(12, 8, 10, 8); inner.setSpacing(6)
+        self.label = QLabel("25:00", objectName="timerLabel")
+        self.pause = QPushButton("暂停", objectName="timerBtn"); self.pause.clicked.connect(pause)
+        reset_button = QPushButton("重置", objectName="timerBtn"); reset_button.clicked.connect(reset)
+        stop_button = QPushButton("停止", objectName="timerBtn"); stop_button.clicked.connect(stop)
+        inner.addWidget(self.label, 1)
+        for button in (self.pause, reset_button, stop_button): inner.addWidget(button)
+        self.setStyleSheet('QFrame#timerRoot { background:rgba(255,255,255,235); border:1px solid #E8E4F2; border-radius:14px; } QLabel#timerLabel { color:#5C5275; font-weight:600; } QPushButton#timerBtn { background:#F2EFF9; color:#73688F; border:0; border-radius:8px; padding:6px 8px; } QPushButton#timerBtn:hover { background:#E9E3F7; }')
 
     def place(self) -> None:
         point = self.pet.frameGeometry().topLeft() - QPoint(0, self.height() + 8); self.move(point)
+
+    def set_paused(self, paused: bool) -> None:
+        """按钮文字跟着状态走：暂停中显示「继续」。"""
+        self.pause.setText("继续" if paused else "暂停")
 
 
 class PetCanvas(QWidget):
@@ -523,8 +550,8 @@ class PetCanvas(QWidget):
 
 
 class PetWindow(QWidget):
-    def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None]) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
+    def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None], notify: Callable[[str, str], None] | None = None) -> None:
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.notify = notify; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self._pomodoro_total = 0; self.following = False; self._think_until = 0.0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
@@ -532,7 +559,7 @@ class PetWindow(QWidget):
         self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy); self.conversation.reasoning_changed.connect(self._on_reasoning_changed)
         self.conversation.consolidated.connect(self._on_consolidated)
         self.conversation.mood_changed.connect(self._on_mood_changed)
-        self.chat = ChatDialog(self, self.conversation); self.timer_window = TimerWindow(self, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place()
+        self.chat = ChatDialog(None, self.conversation); self.timer_window = TimerWindow(self, self.toggle_pomodoro, self.reset_pomodoro, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._follow_timer = QTimer(self); self._follow_timer.setInterval(FOLLOW_TICK_MS); self._follow_timer.timeout.connect(self._follow_step); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place(); self._resume_motion()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
     def _sync_geometry(self) -> None:
@@ -570,7 +597,7 @@ class PetWindow(QWidget):
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
     def _on_conversation_busy(self, busy: bool) -> None:
         # 刚发出消息、还一个分片都没到的时候，先按"思考"处理
-        if busy: self._reasoning = True; self.canvas.set_state('Think')
+        if busy: self._reasoning = True; self.canvas.set_state('Think'); self.animation.stop()
         else: self._reasoning = False; self._restore_state()
     def _on_reasoning_changed(self, reasoning: bool) -> None:
         """收到推理内容 = 模型还在想；正文开始流 = 模型开始说。
@@ -580,6 +607,7 @@ class PetWindow(QWidget):
         """
         if not self.conversation.busy: return
         self._reasoning = reasoning
+        if reasoning: self.animation.stop()
         self.canvas.set_state('Think' if reasoning else 'Talk')
     def begin_new_session(self) -> None:
         """启动时开一段全新会话：历史靠长期记忆承载，对话窗从空开始。"""
@@ -654,14 +682,34 @@ class PetWindow(QWidget):
         return 'Focus' if self.tick.isActive() else 'Idle'
     def _restore_state(self) -> None:
         self.canvas.set_state(self._base_state())
+    def _thinking(self) -> bool:
+        """现在是不是正摆着"思考"动作：推理中，或刚弹过一句气泡（气泡配的也是 Think）。
+
+        这时候一律站着不动——一动起来，思考动作就被 Move 素材盖住了，看着像边发呆边挪。
+        """
+        return self._reasoning or time.monotonic() < self._think_until
     def _on_wander_finished(self) -> None:
         # 拖拽中不要覆盖 Drag 姿态（松手时 mouseReleaseEvent 会自己恢复）
         if not self.drag: self._restore_state()
+        # 跟随中：这一步走完立刻接着下一步，中间不留停顿
+        if self.following: QTimer.singleShot(0, self._follow_step)
+    def _build_motion_menu(self, menu: QMenu) -> None:
+        """「动作」面板：固定 / 移动 / 跟随鼠标，三选一。"""
+        # 和表情子菜单一样必须持有引用：addMenu(str) 返回的子菜单会被 PySide 回收
+        submenu = styled_menu(menu, '动作')
+        menu.addMenu(submenu); self._motion_menu = submenu
+        group = QActionGroup(submenu); group.setExclusive(True)
+        mode = str(load_settings()['motion']['mode'])
+        for label, value in (('固定模式','stationary'), ('自由移动','movable'), ('跟随鼠标','follow')):
+            action = submenu.addAction(label); action.setCheckable(True); action.setChecked(mode==value)
+            action.triggered.connect(lambda checked=False, target=value: self.set_motion_mode(target))
+            group.addAction(action)
     def _build_context_menu(self) -> QMenu:
-        d=load_settings(); movable=d['motion']['mode']=='movable'; m=styled_menu(self)
-        a=m.addAction('切换为固定模式' if movable else '切换为自由模式'); a.triggered.connect(self.toggle_mode); m.addSeparator()
-        self._build_expression_menu(m); m.addSeparator()
-        a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.tick.isActive() else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.tick.isActive() else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
+        d=load_settings(); m=styled_menu(self)
+        self._build_expression_menu(m)
+        self._build_motion_menu(m)
+        m.addSeparator()
+        a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.pomodoro_active else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.pomodoro_active else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
         return m
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
         self._build_context_menu().exec(e.globalPos())
@@ -678,30 +726,106 @@ class PetWindow(QWidget):
         if e.button()==Qt.LeftButton: self.drag=None; self._restore_state()
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
         if hasattr(self,'timer_window') and self.timer_window.isVisible(): self.timer_window.place()
-    def toggle_mode(self)->None:
-        d=load_settings(); d['motion']['mode']='stationary' if d['motion']['mode']=='movable' else 'movable'; save_settings(d); self.refresh_settings(d); self.say('固定位置' if d['motion']['mode']=='stationary' else '自由移动')
+    def set_motion_mode(self, mode: str, notice: bool = True)->None:
+        """切换动作模式：``stationary`` 固定 / ``movable`` 自由走动 / ``follow`` 跟随鼠标。
+
+        ``notice=False`` 用于启动时静默落回默认模式，不弹气泡。
+        """
+        if mode not in ('stationary','movable','follow'): mode='stationary'
+        d=load_settings(); d['motion']['mode']=mode; save_settings(d)
+        self.following = mode=='follow'
+        if self.following:
+            self._follow_timer.start(FOLLOW_TICK_MS); self._follow_step()
+        else:
+            self._follow_timer.stop(); self.animation.stop(); self._restore_state()
+        if notice: self.say({'stationary':'固定在这里','movable':'自由走动','follow':'跟着你走'}[mode])
+    def exit_follow(self)->None:
+        """退出跟随（右键里取消）：原地停下，回到固定模式。"""
+        if self.following: self.set_motion_mode('stationary')
+    def _resume_motion(self)->None:
+        """每次启动都回到「自由移动」。
+
+        跟随是"追着光标跑"，上次没退出就再启动会显得莫名其妙；固定模式点一次菜单就有，
+        也不指望它被记住。所以启动时一律落到自由移动，并写回配置——右键菜单的勾选和
+        随机游走都读这份配置。
+        """
+        self.set_motion_mode('movable', notice=False)
+    def _follow_standoff(self)->float:
+        """停下时离鼠标多远：窗口半对角线 + 一点余量。
+
+        用半对角线（而不是宽或高的一半）：不管从哪个方向靠近，这个距离都能让鼠标
+        落在窗口外面——停下时不压住鼠标，也就不会挡住鼠标的点击。
+        """
+        return math.hypot(self.width()/2, self.height()/2) + FOLLOW_MARGIN
+    def _follow_step(self)->None:
+        """朝鼠标走一步：速度沿用 MOVE_SPEED，走到离线一段距离就停住。"""
+        if not self.following or self.drag or self.pinned_expression is not None: return
+        # 思考动作期间不动（跟随机游走一个道理）
+        if self._thinking(): return
+        if self.animation.state()==QPropertyAnimation.State.Running: return
+        cursor=QCursor.pos(); center=self.frameGeometry().center()
+        dx=cursor.x()-center.x(); dy=cursor.y()-center.y(); distance=math.hypot(dx,dy); standoff=self._follow_standoff()
+        if distance<=standoff: return
+        step=min(distance-standoff, MOVE_SPEED*FOLLOW_STEP_MS/1000)
+        if step<1: return
+        area=self.screen().availableGeometry(); target=self.pos()
+        # 逼近到"再走一步就会压住鼠标"为止：鼠标贴着屏幕边缘时，理想停点会被屏幕边界
+        # 挤回来，宁可就地停住也不能让窗口盖住鼠标——盖住就点不动了。
+        for _ in range(6):
+            ratio=step/distance
+            point=QPoint(round(self.x()+dx*ratio), round(self.y()+dy*ratio))
+            point=QPoint(max(area.left(),min(area.right()-self.width(),point.x())), max(area.top(),min(area.bottom()-self.height(),point.y())))
+            if not (point.x()<=cursor.x()<point.x()+self.width() and point.y()<=cursor.y()<point.y()+self.height()):
+                target=point; break
+            step*=0.7
+        moved=math.hypot(target.x()-self.x(), target.y()-self.y())
+        if moved<2: return
+        # 时长按**实际**位移折算：不管是被屏幕边界夹过还是缩短过，速度都还是 MOVE_SPEED
+        self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop()
+        self.animation.setStartValue(self.pos()); self.animation.setEndValue(target)
+        self.animation.setDuration(max(80, round(moved/MOVE_SPEED*1000))); self.animation.start()
     def apply_settings(self, data:dict)->None:
         # 对话窗的开关已取消：只由右键菜单打开，保存设置不再改动它的可见性
         self.load_character(data); self.show_pet()
         if self.isVisible(): self.say('设置已保存')
     def close_chat(self)->None: self.chat.hide()
+    @property
+    def pomodoro_active(self) -> bool:
+        """番茄钟开着（含暂停）：浮窗还显示着就算，暂停时不该变回"开始"。"""
+        return self.timer_window.isVisible()
     def start_pomodoro(self)->None:
-        self.remaining=load_settings()['tools']['pomodoro_minutes']*60; self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.canvas.set_state('Focus'); self.say('开始专注')
-    def stop_pomodoro(self)->None: self.tick.stop(); self.timer_window.hide(); self.canvas.set_state('Idle'); self.say('番茄钟已停止')
+        self._pomodoro_total=load_settings()['tools']['pomodoro_minutes']*60; self.remaining=self._pomodoro_total
+        self.timer_window.set_paused(False); self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.canvas.set_state('Focus'); self.say('开始专注')
+    def toggle_pomodoro(self)->None:
+        """暂停 / 继续。浮窗不隐藏——它同时是"继续"的入口。"""
+        if self.tick.isActive():
+            self.tick.stop(); self.timer_window.set_paused(True); self._restore_state(); self.say('番茄钟已暂停')
+        else:
+            self.tick.start(1000); self.timer_window.set_paused(False); self.canvas.set_state('Focus'); self.say('继续专注')
+    def reset_pomodoro(self)->None:
+        """回到设定时长并停下（浮窗留着，随时可以再点继续）。"""
+        self.tick.stop(); self._pomodoro_total=load_settings()['tools']['pomodoro_minutes']*60; self.remaining=self._pomodoro_total
+        self._timer_text(); self.timer_window.set_paused(False); self._restore_state(); self.say('番茄钟已重置')
+    def stop_pomodoro(self)->None:
+        self.tick.stop(); self.timer_window.hide(); self.timer_window.set_paused(False); self._restore_state(); self.say('番茄钟已停止')
     def _timer_text(self)->None: self.timer_window.label.setText(f'{self.remaining//60:02d}:{self.remaining%60:02d}')
     def _tick(self)->None:
         self.remaining-=1; self._timer_text()
-        if self.remaining<=0: self.tick.stop(); self.timer_window.hide(); self.canvas.set_state('Idle'); self.say('专注完成！',5000)
+        if self.remaining<=0:
+            self.tick.stop(); self.timer_window.hide(); self.timer_window.set_paused(False); self._restore_state(); self.say('专注完成！',5000)
+            if self.notify is not None: self.notify('番茄钟结束', f'{max(1,self._pomodoro_total//60)} 分钟专注完成，起来动一动吧～')
     def _wander(self)->None:
         if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
-        # 推理期间不随机移动：一走路，思考动作就被 Move 素材盖住了
-        if self._reasoning: return
+        # 思考动作期间不随机移动：一走路，思考动作就被 Move 素材盖住了
+        if self._thinking(): return
         _, chance, distance = motion_profile(self.activity)
         if self._mood_state is not None: chance *= MOOD_MOVE_DAMPING
         if random.random()>chance: return
         area=self.screen().availableGeometry(); target=QPoint(max(area.left(),min(area.right()-self.width(),self.x()+random.randint(-distance,distance))),max(area.top(),min(area.bottom()-self.height(),self.y()+random.randint(-distance//2,distance//2)))); self.canvas.set_state('Move', mirrored=wander_mirrored(target.x()-self.x())); self.animation.stop(); self.animation.setStartValue(self.pos()); self.animation.setEndValue(target); self.animation.setDuration(move_duration(self.pos(), target)); self.animation.start()
-    def say(self,text:str,duration:int=2300)->None:
-        # 气泡都是"在处理 / 状态提示"，一律配思考动作；说话动作只留给模型正文输出
+    def say(self,text:str,duration:int=SAY_MS)->None:
+        # 气泡都是"在处理 / 状态提示"，一律配思考动作；说话动作只留给模型正文输出。
+        # 摆着思考动作时一律不动（跟推理时同一套规则），所以顺手停掉当前这段移动。
+        self._think_until=time.monotonic()+duration/1000; self.animation.stop()
         self.bubble.setText(text); self.bubble.show(); QTimer.singleShot(duration,self.bubble.hide); self.canvas.show_temporary('Think',duration)
 
 

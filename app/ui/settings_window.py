@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
 )
 from app import characters, devtools
-from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.conversation.service import check_connection
+from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
 from app.ui.dev_window import DevWindow
 from app.ui.dialogs import StyledDialog
@@ -760,6 +760,12 @@ class SettingsWindow(QMainWindow):
         menu = styled_menu(self); open_action = QAction("打开设置", self); open_action.triggered.connect(self.show_from_tray)
         quit_action = QAction("退出", self); quit_action.triggered.connect(QApplication.instance().quit)
         menu.addAction(open_action); menu.addSeparator(); menu.addAction(quit_action); self.tray.setContextMenu(menu); self.tray.show()
+
+    def notify(self, title: str, text: str) -> None:
+        """弹一条系统通知（走托盘图标）。平台不支持气泡时静默跳过，不影响调用方。"""
+        if not QSystemTrayIcon.supportsMessages():
+            return
+        self.tray.showMessage(title, text, app_icon(), 6000)
 
     def show_page(self, index: int) -> None:
         if index == self.stack.currentIndex(): return

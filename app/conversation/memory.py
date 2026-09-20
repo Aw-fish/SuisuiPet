@@ -572,10 +572,25 @@ class MemoryStore:
     # ---- L3 摘要 -------------------------------------------------------------
 
     def write_summary(self, text: str, month: str | None = None) -> None:
-        """按月份写入滚动摘要。"""
+        """写入当月滚动摘要，并清掉已经并进去的旧文件。
+
+        摘要是"旧摘要 + 这段对话"合并成一段新的，所以写完当月这份之后，更早的月份文件
+        （以及旧的单文件 ``summary.md``）的内容都已经在里面了。留着的话 ``summary_text()``
+        会把同一段话拼好几遍，而且逐月累积。空文本不写也不清，免得把历史抹掉。
+        """
+        body = text.strip()
+        if not body:
+            return
         self.summaries_dir.mkdir(parents=True, exist_ok=True)
         name = month or _now().strftime("%Y-%m")
-        (self.summaries_dir / f"{name}.md").write_text(text.strip() + "\n", encoding="utf-8")
+        target = self.summaries_dir / f"{name}.md"
+        target.write_text(body + "\n", encoding="utf-8")
+        # 只删比它更早的月份——`YYYY-MM.md` 按文件名排序就是按时间排序，
+        # 万一系统时间回拨留下更新的文件，别误删
+        for path in self.summaries_dir.glob("*.md"):
+            if path != target and path.name < target.name:
+                path.unlink(missing_ok=True)
+        self.legacy_summary_path.unlink(missing_ok=True)
 
     def summary_text(self, months: int = 3) -> str:
         """把最近几个月的摘要拼起来；顺带兼容旧的单文件 summary.md。"""
