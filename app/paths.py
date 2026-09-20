@@ -17,3 +17,5 @@ SOURCE_ART_PATH = DATA_DIR / "img" / "Default.png"
 #: 应用 / 任务栏图标（由 tools/make_icon.py 生成）
 ICON_PATH = DATA_DIR / "icon.ico"
 ICON_PNG_PATH = DATA_DIR / "icon.png"
+#: 开发者面板的运行日志（本地文件，不进版本控制；面板上的「清除缓存」会删掉它）
+DEVTOOLS_LOG_PATH = DATA_DIR / "devtools.log"

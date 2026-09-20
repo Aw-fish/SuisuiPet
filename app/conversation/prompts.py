@@ -5,7 +5,7 @@ system 消息是把好几块内容拼起来的（原则、人设、表情说明�
 
 * :meth:`app.conversation.service.ConversationService._system_prompt` —— 【基本原则】/【角色设定】
 * :meth:`app.conversation.service.ConversationService._runtime_notes` —— 表情标记的说明，作为运行期说明传给下面
-* :meth:`app.conversation.memory.MemoryStore.build_context` —— 【标记说明】（表情标记 + 对话背景）/【被打断】/【长期记忆】/【相关记忆】/【过往摘要】
+* :meth:`app.conversation.memory.MemoryStore.build_context` —— 【标记说明】（表情标记 + 当前时间）/【被打断】/【长期记忆】/【相关记忆】/【过往摘要】
 
 """
 
@@ -18,8 +18,8 @@ BASIC = "【基本原则】"
 PERSONA = "【角色设定】"
 
 # ---- 运行期注入的说明（memory.build_context）--------------------------------
-#: 表情标记与对话背景（时间）的说明合成同一节：
-#: 两块内容各按自己的条件决定要不要出现（自动表情开关 / 本次是否带对话背景）。
+#: 表情标记与当前时间（时间）的说明合成同一节：
+#: 两块内容各按自己的条件决定要不要出现（自动表情开关 / 本次是否带当前时间）。
 MARKS = "【标记说明】"
 #: 被打断标记的说明，只在上下文里真带着被打断的回复时出现
 INTERRUPT = "【被打断】"

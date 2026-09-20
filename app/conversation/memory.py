@@ -276,6 +276,22 @@ class MemoryStore:
         with self.session_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(message.to_record(), ensure_ascii=False) + "\n")
 
+    def append_user(self, text: str) -> Message:
+        """落盘一条用户消息，并在该"对表"的时候把「现在时间」旁白挂到它身上。
+
+        旁白在**写的时候**就定下来（而不是每次发请求现加）：它会随消息一起落盘，
+        以后每一轮发历史时都还带着。否则上一轮的时间行会在下一轮"挪"到新消息上，
+        模型从第二轮起就完全看不到时间信息了。
+
+        什么时候该挂见 :meth:`_time_narration`——第一轮，或距上一条用户消息超过
+        ``NARRATION_GAP_MINUTES``；同一段对话里连着聊就不重复挂。
+        """
+        message = Message(role=ROLE_USER, content=text)
+        history = [item for item in self.load() if item.role in (ROLE_USER, ROLE_ASSISTANT)]
+        message.narration = self._time_narration(history + [message])
+        self.append(message)
+        return message
+
     def read_session(self, path: Path) -> list[Message]:
         messages: list[Message] = []
         if not path.is_file():
@@ -708,14 +724,14 @@ class MemoryStore:
             and (message.content.strip() or message.interrupted)
         ]
         recent = history[-max(1, limit):]
-        narration = self._time_narration(recent)
         sections: list[str] = []
         if system_prompt.strip():
             sections.append(system_prompt.strip())
-        # 表情标记（service 传进来的运行期说明）与对话背景说明合成同一节：
-        # 两块各自按条件出现——没开自动表情 / 本次不带对话背景时，都不花这份 token
+        # 表情标记（service 传进来的运行期说明）与当前时间说明合成同一节：
+        # 两块各自按条件出现——没开自动表情 / 窗口里没有时间行时，都不花这份 token
         marks = [str(note).strip() for note in notes if str(note).strip()]
-        if narration:
+        if any(message.narration for message in recent):
+            # 时间行是消息自带的属性：窗口里还有，模型就还会看到这个标记
             marks.append(NARRATION_HINT)
         if marks:
             sections.append(f"{prompts.MARKS}\n" + "\n".join(marks))
@@ -737,29 +753,16 @@ class MemoryStore:
         context: list[dict[str, Any]] = []
         if sections:
             context.append({"role": ROLE_SYSTEM, "content": "\n\n".join(sections)})
-        # 旁白挂在最后一条用户消息前面：模型会把它读成"这句话的背景"，
-        # 而不是一条需要单独回应的内容。
-        latest_user = next(
-            (index for index in range(len(recent) - 1, -1, -1) if recent[index].role == ROLE_USER),
-            -1,
-        )
-        for index, message in enumerate(recent):
-            context.append(message.to_api(narration if index == latest_user else ""))
-        # 交给开发者面板：它要能看到这次到底拼了什么（含旁白、系统段、每轮的时间）
+        # 时间行挂在消息自己身上（写的时候定下来、随会话落盘），这里只照它转格式
+        for message in recent:
+            context.append(message.to_api())
+        # 交给开发者面板：原样记下真正发出去的消息数组——面板直接照它铺开，
+        # 不做任何"分块"复原（那会把一条 system 显示成好几条）。
+        # 时间行与 [被打断] 都在消息内容里，面板不必再单独标注。
         devtools.record(
             "context",
             character=self.character,
             query=query,
-            narration=narration,
-            sections=list(sections),
-            turns=[
-                {
-                    "role": message.role,
-                    "ts": message.ts,
-                    "interrupted": message.interrupted,
-                    "content": message.content,
-                }
-                for message in recent
-            ],
+            messages=[{"role": item["role"], "content": item["content"]} for item in context],
         )
         return context

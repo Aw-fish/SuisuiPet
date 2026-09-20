@@ -74,12 +74,20 @@ def check_connection(info: dict) -> tuple[bool, str]:
     return True, f"连接成功，模型 {model} 可用"
 
 
+#: 推理内容转发给开发者面板的节奏：攒够这么多字符、或距上次超过这么久，就发一次。
+#: 推理动辄上千个片段，逐个发会淹掉主线程——面板那边也刷不过来。
+REASONING_FLUSH_CHARS = 120
+REASONING_FLUSH_SECONDS = 0.2
+
+
 class _StreamWorker(QThread):
     """在工作线程里跑一次流式请求。"""
 
     delta = Signal(str)
     #: True = 收到推理内容（还在想），False = 正文开始了（开始说）
     reasoning_changed = Signal(bool)
+    #: 限频转发出去的推理片段（只喂开发者面板，用来实时长出来）
+    reasoning_delta = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
 
@@ -88,6 +96,9 @@ class _StreamWorker(QThread):
         self._provider = provider
         self._messages = list(messages)
         self._cancel = threading.Event()
+        #: 这一轮攒下的推理内容（``reasoning_content``），收尾时交给开发者面板。
+        #: 推理片段动辄上千个，不逐个发信号，只在这里累加。
+        self.reasoning = ""
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -102,10 +113,29 @@ class _StreamWorker(QThread):
         error = ""
         reasoning = False
         speaking = False
+        pending: list[str] = []
+        last_flush = time.monotonic()
+
+        def flush_reasoning() -> None:
+            """把攒下的推理片段一次性交给面板（它那边实时往折叠块里追加）。"""
+            nonlocal last_flush
+            if pending:
+                self.reasoning_delta.emit("".join(pending))
+                pending.clear()
+            last_flush = time.monotonic()
+
         try:
             for chunk in self._provider.stream(self._messages, cancel=self._cancel):
                 if self._cancel.is_set():
                     break
+                if chunk.reasoning:
+                    self.reasoning += chunk.reasoning
+                    pending.append(chunk.reasoning)
+                    if (
+                        sum(len(item) for item in pending) >= REASONING_FLUSH_CHARS
+                        or time.monotonic() - last_flush >= REASONING_FLUSH_SECONDS
+                    ):
+                        flush_reasoning()
                 # 只在状态真的翻转时发信号：推理片段动辄上千个，逐个发会淹掉主线程
                 if chunk.reasoning and not reasoning:
                     reasoning = True
@@ -123,6 +153,8 @@ class _StreamWorker(QThread):
             error = str(exc)
         except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
             error = f"请求出错：{exc}"
+        # 收尾前把尾巴发出去，免得最后不满一个节流窗口的那几句卡在缓冲里
+        flush_reasoning()
         # 主动打断会把阻塞中的连接掐断，读取随之抛异常——那是预期行为，不是失败。
         # 这里一律按正常结束交回去，由上层以「被打断」收尾并保留已生成的部分。
         if self._cancel.is_set():
@@ -185,6 +217,8 @@ class ConversationService(QObject):
         self._splitter = SentenceSplitter()
         self._tag_filter = TagFilter()
         self._clean: list[str] = []
+        #: 本轮从回复里剥掉了多少个表情标记（只给开发者面板看）
+        self._tag_count = 0
         self._auto_expression = False
         #: 本次请求的时间基准，用来算首字延迟与总耗时（只给开发者面板看）
         self._started_at: float | None = None
@@ -284,33 +318,36 @@ class ConversationService(QObject):
             return
         self._tag_filter.reset()
         self._clean.clear()
-        self._memory.append(Message(role=ROLE_USER, content=text))
-        # 把用户这句话交给记忆检索，召回与当前话题相关的长期记忆
-        messages = self._memory.build_context(
-            self._system_prompt(), self._context_limit(), text, self._runtime_notes()
-        )
-        self._started_at = time.monotonic()
-        self._first_delta_at = None
+        self._tag_count = 0
+        user_message = self._memory.append_user(text)
+        # 参数先记录、再组装上下文：面板按发生顺序铺开，卡片头要排在"这一轮发了什么"前面
         devtools.record(
             "request",
             character=self._character,
             model=str(self._info.get("model", "")),
             temperature=self._info.get("temperature"),
             context_limit=self._context_limit(),
-            count=len(messages),
-            chars=sum(len(str(item.get("content", ""))) for item in messages),
+            # 这一轮新挂了时间行（面板据此在分隔线上标一句，说明从这里重新"对表"）
+            narration=user_message.narration,
         )
+        # 把用户这句话交给记忆检索，召回与当前话题相关的长期记忆
+        messages = self._memory.build_context(
+            self._system_prompt(), self._context_limit(), text, self._runtime_notes()
+        )
+        self._started_at = time.monotonic()
+        self._first_delta_at = None
+        tokens = sum(devtools.estimate_tokens(str(item.get("content", ""))) for item in messages)
         devtools.log.info(
-            "对话 · 发出请求（%s，上下文 %d 条 / %d 字）",
+            "对话 · 发出请求（%s，上下文 %d 条 / 约 %d token）",
             self._character or "未选角色",
             len(messages),
-            sum(len(str(item.get("content", ""))) for item in messages),
+            tokens,
         )
         self._splitter.reset()
         worker = _StreamWorker(provider, messages, self)
         worker.delta.connect(self._on_delta)
-        # 推理状态不需要加工，直接转发给界面
-        worker.reasoning_changed.connect(self.reasoning_changed)
+        worker.reasoning_changed.connect(self._on_reasoning_changed)
+        worker.reasoning_delta.connect(self._on_reasoning_delta)
         worker.finished.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(worker.deleteLater)
@@ -333,6 +370,7 @@ class ConversationService(QObject):
             self._first_delta_at = time.monotonic()
         # 先在流上剥掉情绪标记，下游（界面 / 落盘 / 句级切分）拿到的都是干净正文
         clean, tags = self._tag_filter.feed(text)
+        self._tag_count += len(tags)
         for tag in tags:
             self.mood_changed.emit(mood_asset(tag))
         if not clean:
@@ -342,12 +380,24 @@ class ConversationService(QObject):
         for sentence in self._splitter.feed(clean):
             self.sentence.emit(sentence)
 
+    def _on_reasoning_changed(self, reasoning: bool) -> None:
+        # 正文一开始，就让开发者面板把"深度思考"收起来（跟主流 AI 前端一个做法）
+        if not reasoning:
+            devtools.preview("reasoning_done")
+        self.reasoning_changed.emit(reasoning)
+
+    def _on_reasoning_delta(self, text: str) -> None:
+        """推理内容的限频预览：只喂开发者面板，不进记忆、也不进对话界面。"""
+        devtools.preview("reasoning", text=text)
+
     def _on_finished(self, text: str) -> None:
-        # worker 回传的是原始全文（还带着标记），所以用自己累计的干净文本收尾
-        tail, _tags = self._tag_filter.flush()
+        # worker 回传的是原始全文（还带着标记），所以用自己累计的干净文本收尾；
+        # 原始那份留给开发者面板对照——能看出模型究竟标了什么、又被剥掉了什么。
+        tail, tags = self._tag_filter.flush()
+        self._tag_count += len(tags)
         if tail:
             self._clean.append(tail)
-        self._finalize("".join(self._clean))
+        self._finalize("".join(self._clean), raw=text)
 
     def _on_failed(self, message: str) -> None:
         worker = self._worker
@@ -357,10 +407,12 @@ class ConversationService(QObject):
             return
         self._finalize("", error=message)
 
-    def _finalize(self, text: str, error: str = "") -> None:
+    def _finalize(self, text: str, error: str = "", raw: str = "") -> None:
         worker = self._worker
         self._worker = None
         interrupted = bool(worker is not None and worker.cancelled)
+        #: 推理内容也算这一次的产出（推理模型可能几千 token 都在这里）
+        reasoning = worker.reasoning if worker is not None else ""
         if self._memory is not None and (text or interrupted):
             self._memory.append(
                 Message(role=ROLE_ASSISTANT, content=text, interrupted=interrupted)
@@ -375,6 +427,9 @@ class ConversationService(QObject):
         devtools.record(
             "reply",
             text=text,
+            raw=raw,
+            reasoning=reasoning,
+            tags=self._tag_count,
             interrupted=interrupted,
             error=error,
             first_token_ms=round(first * 1000),
@@ -383,12 +438,17 @@ class ConversationService(QObject):
         if error:
             devtools.log.warning("对话 · 请求失败：%s", error)
         else:
+            body_tokens = devtools.estimate_tokens(text)
+            reasoning_tokens = devtools.estimate_tokens(reasoning)
+            notes = f"，其中思考 {reasoning_tokens}" if reasoning_tokens else ""
+            if interrupted:
+                notes += "，被打断"
             devtools.log.info(
-                "对话 · 回复完成（用时 %.2fs，首字 %.2fs，%d 字%s）",
+                "对话 · 回复完成（用时 %.2fs，首字 %.2fs，约 %d token%s）",
                 total,
                 first,
-                len(text),
-                "，被打断" if interrupted else "",
+                body_tokens + reasoning_tokens,
+                notes,
             )
         self.busy_changed.emit(False)
         if error:
@@ -400,7 +460,7 @@ class ConversationService(QObject):
         """拼成一条 system：每块前面都带一个大标题（见 app/conversation/prompts.py）。
 
         顺序是"通用约束 → 角色人设"：先定基调，再定人设。表情标记这类运行期说明
-        交给 :meth:`_runtime_notes`，由 build_context 与对话背景说明合成同一节。
+        交给 :meth:`_runtime_notes`，由 build_context 与当前时间说明合成同一节。
         """
         parts: list[str] = []
         base = str(self._base_prompt).strip()

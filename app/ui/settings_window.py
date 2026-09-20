@@ -432,9 +432,10 @@ class SettingsWindow(QMainWindow):
         layout.addSpacing(14)
         layout.addWidget(self._label("面板里能看到什么"))
         for line in (
-            "· 每次请求拼出的完整上下文：系统段逐段列出，对话背景、每一轮消息的角色与时间都在；",
-            "· 实发条数与总字数、模型与温度、首字延迟与总耗时、是否被打断；",
-            "· 运行日志：发请求、打断、请求失败、记忆整理的结果都会记一行。",
+            "· 每次请求真正发出去的消息：system 只铺一次，其余只追加新增的几条；",
+            "· 条数与 token 估算、模型与温度、首字延迟与总耗时、是否被打断；",
+            "· 模型的深度思考收在可折叠的区块里，推理期间实时长出来；",
+            "· 运行日志：发请求、打断、请求失败、记忆整理的结果都会记一行（另存本地文件）。",
         ):
             hint = QLabel(line, objectName="hint")
             hint.setWordWrap(True)

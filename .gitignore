@@ -4,6 +4,8 @@ __pycache__/
 
 # User-specific runtime configuration
 data/settings.json
+# 开发者面板的本地日志（面板里的「清除缓存」可以删掉）
+data/devtools.log
 
 # 角色数据：只跟踪示例角色 default 的立绘，其余角色一律不进仓库
 data/characters/*
@@ -13,5 +15,6 @@ data/characters/*/memory/
 # 角色配置里有 API Key，同样不跟踪（gitignore 只能忽略整个文件，不能只忽略某个字段）
 data/characters/*/character.json
 
-# 记忆系统的设计笔记，保留在本地，不随仓库同步
+# 记忆系统的设计笔记与开发日志，保留在本地，不随仓库同步
 memory.md
+devlog.md
