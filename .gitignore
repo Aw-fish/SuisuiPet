@@ -6,6 +6,8 @@ __pycache__/
 data/settings.json
 # 开发者面板的本地日志（面板里的「清除缓存」可以删掉）
 data/devtools.log
+# 记事板内容属于私人笔记
+data/notes.md
 
 # 角色数据：只跟踪示例角色 default 的立绘，其余角色一律不进仓库
 data/characters/*

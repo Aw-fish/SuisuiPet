@@ -36,12 +36,11 @@ from app.pet.emotion import EXPRESSION_HINT, TagFilter, mood_asset
 DEFAULT_LIMIT = 20
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TIMEOUT = 60
-#: 同类事件两次转发之间至少隔多久。只对下面 COOLDOWN_TAGS 里的事件生效。
-EVENT_COOLDOWN_SECONDS = 20
-#: 需要冷却的事件：拖动会在松手时反复触发（随手挪一下也算），每个事件都是一次真实
-#: 请求，不拦一下会烧掉大量调用。番茄钟与模式切换都是明确的单次动作——来了就该告诉
-#: 模型，否则"开始专注 → 十分钟后暂停"这种前后关系就断了。
-COOLDOWN_TAGS = frozenset({"拖动"})
+#: 各事件的冷却秒数（没列出的事件不冷却，来了就发）。
+#: 只拦会反复触发的：拖动每次松手都可能算一次，记事板每敲几下就写一次——每个事件都是
+#: 一次真实请求，不拦一下会烧掉大量调用。番茄钟与动作模式是明确的单次动作，冷却反而会
+#: 让"开始专注 → 十分钟后暂停"这种前后关系断掉。
+EVENT_COOLDOWN = {"拖动": 20, "记事板": 10}
 
 
 def _as_float(value: Any, fallback: float) -> float:
@@ -344,13 +343,13 @@ class ConversationService(QObject):
         :data:`SILENT_MARK`，本地捕获后界面上什么都不显示）。两种情况下直接丢掉：
 
         * 上一轮还在生成——事件是"刚刚发生"的事，排队只会让模型面对一串过期动作；
-        * :data:`COOLDOWN_TAGS` 里的事件（目前只有拖动）在 ``EVENT_COOLDOWN_SECONDS``
-          秒内已经发过——拖动每次松手都可能触发，不拦一下会烧掉大量调用。
+        * :data:`EVENT_COOLDOWN` 里列了冷却的事件（拖动、记事板）在该秒数内已经发过。
         """
         if self._memory is None or self.busy:
             return False
         now = time.monotonic()
-        if tag in COOLDOWN_TAGS and now - self._event_at.get(tag, 0.0) < EVENT_COOLDOWN_SECONDS:
+        cooldown = EVENT_COOLDOWN.get(tag, 0)
+        if cooldown and now - self._event_at.get(tag, 0.0) < cooldown:
             return False
         provider = self._provider(report=False)
         if provider is None:

@@ -19,3 +19,5 @@ ICON_PATH = DATA_DIR / "icon.ico"
 ICON_PNG_PATH = DATA_DIR / "icon.png"
 #: 开发者面板的运行日志（本地文件，不进版本控制；面板上的「清除缓存」会删掉它）
 DEVTOOLS_LOG_PATH = DATA_DIR / "devtools.log"
+#: 记事板内容（纯文本，本地文件，不进版本控制）
+NOTES_PATH = DATA_DIR / "notes.md"

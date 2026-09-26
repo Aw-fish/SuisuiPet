@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from app import characters
 from app.conversation.memory import KINDS, KIND_LABELS, MemoryEntry, MemoryStore
 from app.conversation.service import ConsolidationWorker
-from app.ui.dialogs import ACCENT, StyledDialog
+from app.ui.dialogs import ACCENT, StyledDialog, block_wheel
 
 WINDOW_SIZE = (560, 660)
 
@@ -73,6 +73,8 @@ class MemoryEditDialog(QDialog):
         self.importance = QSlider(Qt.Horizontal)
         self.importance.setRange(1, 5)
         self.importance.setValue(entry.importance)
+        # 类别下拉与重要度滑块都不吃滚轮，免得滚页面时改到记忆
+        self._wheel_guard = block_wheel(self, self.kind, self.importance)
         self.importance_value = QLabel(str(entry.importance), objectName="chip")
         self.importance_value.setFixedWidth(28)
         self.importance_value.setAlignment(Qt.AlignCenter)
@@ -159,6 +161,7 @@ class MemoryWindow(QDialog):
         for kind in KINDS:
             self.filter.addItem(KIND_LABELS[kind], kind)
         self.filter.currentIndexChanged.connect(lambda _index: self.refresh())
+        self._wheel_guard = block_wheel(self, self.filter)          # 筛选下拉不吃滚轮
         tools.addWidget(self.filter)
         tools.addStretch()
         self.consolidate_button = QPushButton("整理记忆", objectName="mini")

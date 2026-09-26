@@ -44,7 +44,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "bubble_opacity": 80,
     },
     "motion": {"mode": "stationary"},
-    "tools": {"pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": True},
+    "tools": {
+        "pomodoro_minutes": 25,
+        "weather_city": "",
+        "quick_note_hint": True,
+        #: 记事板背景不透明度（30~100，百分比）
+        "notes_opacity": 90,
+        #: 记事板每次打开的落点：``pet`` 角色旁 / ``corner`` 右下角 / ``center`` 屏幕中间
+        "notes_position": "pet",
+    },
     #: 开发者面板：只看内存里的观察记录，不写文件（见 app/devtools.py）
     "developer": {"enabled": False},
 }

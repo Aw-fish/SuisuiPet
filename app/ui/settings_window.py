@@ -17,7 +17,7 @@ from app.conversation.service import check_connection
 from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
 from app.ui.dev_window import DevWindow
-from app.ui.dialogs import StyledDialog
+from app.ui.dialogs import StyledDialog, WheelGuard, block_wheel
 from app.ui.icons import app_icon
 from app.ui.memory_window import MemoryWindow
 from app.ui.menus import styled_menu
@@ -40,13 +40,6 @@ class _ConnectWorker(QThread):
         self.done.emit(ok, message)
 
 
-class _WheelGuard(QObject):
-    """屏蔽滚轮事件：鼠标划过数值控件时不要改动数值，太容易误触。"""
-
-    def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
-        if event.type() == QEvent.Type.Wheel:
-            event.ignore()
-            return True
         return super().eventFilter(watched, event)
 
 
@@ -129,7 +122,7 @@ class SettingsWindow(QMainWindow):
         self._dev_window: DevWindow | None = None
         self._test_worker: _ConnectWorker | None = None
         # 拦截器必须被持有，否则会被 Python 回收导致失效
-        self._wheel_guards: list[_WheelGuard] = []
+        self._wheel_guards: list[WheelGuard] = []
         self.setWindowTitle("SuisuiPet")
         self.setFixedSize(900, 740)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.NoDropShadowWindowHint)
@@ -187,15 +180,17 @@ class SettingsWindow(QMainWindow):
         content_layout.addWidget(save, alignment=Qt.AlignRight)
         shell.addWidget(sidebar)
         shell.addWidget(content, 1)
-        # 数值控件一律不吃滚轮，避免滚动页面时误改设置
-        self._block_wheel(self.temperature, self.context_limit, self.activity, self.pomodoro, self.expression_sensitivity)
+        # 数值控件一律不吃滚轮，避免滚动页面时误改设置。
+        # 整页扫一遍而不是逐个登记：新加的滑块（对白时长、不透明度就是漏登记的那两个）
+        # 不该还要求记得回来补一行
+        self._block_wheel(*[
+            widget for widget in self.findChildren(QWidget)
+            if isinstance(widget, (QSlider, QComboBox, QSpinBox, QDoubleSpinBox))
+        ])
         self.setStyleSheet(self._qss())
 
     def _block_wheel(self, *widgets: QWidget) -> None:
-        guard = _WheelGuard(self)
-        self._wheel_guards.append(guard)
-        for widget in widgets:
-            widget.installEventFilter(guard)
+        self._wheel_guards.append(block_wheel(self, *widgets))
 
     def _page(self, title: str, description: str) -> tuple[QWidget, QVBoxLayout]:
         """标题固定在顶部，字段区域可滚动，避免以后加设置项时被挤扁。"""
@@ -470,8 +465,35 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self._label("天气城市"))
         self.city = QLineEdit(); self.city.setPlaceholderText("例如：上海")
         layout.addWidget(self.city)
+        layout.addSpacing(18)
+        layout.addWidget(self._label("记事板不透明度"))
+        notes_row = QHBoxLayout()
+        notes_row.setSpacing(10)
+        self.notes_opacity = QSlider(Qt.Horizontal)
+        self.notes_opacity.setRange(30, 100)
+        self.notes_opacity.setSingleStep(1)
+        self.notes_opacity.setFixedHeight(24)
+        self.notes_opacity.valueChanged.connect(self._on_notes_opacity_changed)
+        self.notes_opacity_value = QLabel(objectName="chip")
+        self.notes_opacity_value.setAlignment(Qt.AlignCenter)
+        self.notes_opacity_value.setFixedWidth(52)
+        notes_row.addWidget(self.notes_opacity, 1)
+        notes_row.addWidget(self.notes_opacity_value)
+        layout.addLayout(notes_row)
+        layout.addWidget(QLabel("越高越不透明（30%~100%），只影响记事板。", objectName="hint"))
+        layout.addSpacing(18)
+        layout.addWidget(self._label("记事板窗口位置"))
+        self.notes_pet, self.notes_corner, self.notes_center = QRadioButton("角色旁"), QRadioButton("屏幕右下角"), QRadioButton("屏幕中间")
+        self.notes_group = QButtonGroup(self)
+        for button in (self.notes_pet, self.notes_corner, self.notes_center):
+            self.notes_group.addButton(button)
+            layout.addWidget(button)
+        layout.addWidget(QLabel("每次打开记事板时出现在哪；之后拖到别处也只影响这一次。", objectName="hint"))
         layout.addStretch()
         return page
+
+    def _on_notes_opacity_changed(self, value: int) -> None:
+        self.notes_opacity_value.setText(f"{value}%")
 
     def _developer_page(self) -> QWidget:
         page, layout = self._page("开发者", "调试用的观察窗口：看模型实际收到了什么，以及程序正在做什么。")
@@ -793,6 +815,16 @@ class SettingsWindow(QMainWindow):
         self._on_form_toggled(self.form_bubble.isChecked())
         self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
+        try:
+            notes_opacity = int(t.get("notes_opacity", 90))
+        except (TypeError, ValueError):
+            notes_opacity = 90
+        self.notes_opacity.setValue(max(30, min(100, notes_opacity)))
+        self._on_notes_opacity_changed(self.notes_opacity.value())
+        position = str(t.get("notes_position", "pet"))
+        self.notes_corner.setChecked(position == "corner")
+        self.notes_center.setChecked(position == "center")
+        self.notes_pet.setChecked(position not in ("corner", "center"))
         # 开发者开关：这里只同步界面，真正开启由 PetWindow 按同样的设置执行，
         # 免得"启动时看到开关是开的"就顺手把面板弹出来
         enabled = bool(self.data.get("developer", {}).get("enabled", False))
@@ -818,7 +850,15 @@ class SettingsWindow(QMainWindow):
         self.data["conversation"]["bubble_seconds"] = self.bubble_seconds.value()
         self.data["conversation"]["bubble_opacity"] = self.bubble_opacity.value()
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
-        self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
+        self.data["tools"].update({
+            "pomodoro_minutes": self.pomodoro.value(),
+            "weather_city": self.city.text().strip(),
+            "notes_opacity": self.notes_opacity.value(),
+            "notes_position": (
+                "corner" if self.notes_corner.isChecked()
+                else ("center" if self.notes_center.isChecked() else "pet")
+            ),
+        })
         self.data.setdefault("developer", {})["enabled"] = self.developer_enabled.isChecked()
         self._flush_characters()
         save_settings(self.data)

@@ -19,6 +19,7 @@ from app.pet.character_sprite import CharacterAssets
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
 from app.ui.dialogs import StyledDialog
 from app.ui.menus import styled_menu
+from app.ui.notes_window import NOTES_OPACITY_DEFAULT, NotesWindow
 
 #: 立绘在桌面上的显示高度（像素）
 SPRITE_HEIGHT = 224
@@ -44,6 +45,10 @@ BUBBLE_MIN_WIDTH = 52
 
 #: 对话形式：``window`` 聊天窗口 / ``bubble`` 漂浮输入框 + 角色上方的对白气泡
 FORM_WINDOW, FORM_BUBBLE = "window", "bubble"
+#: 记事板每次打开的落点（设置 → 工具）：角色旁 / 屏幕右下角 / 屏幕中间
+NOTES_POSITION_PET, NOTES_POSITION_CORNER, NOTES_POSITION_CENTER = "pet", "corner", "center"
+#: 贴屏幕角落 / 中间时的边距
+WINDOW_MARGIN = 24
 #: 对白气泡：窗口宽度上下限，以及"文字量 → 窗口尺寸"换算用的内边距与留量
 SPEECH_MAX_WIDTH = 300
 SPEECH_MIN_WIDTH = 110
@@ -478,12 +483,9 @@ class ChatDialog(QDialog):
                 self.drag = None; self.drag_bar.setCursor(Qt.OpenHandCursor); return True
         return super().eventFilter(watched, event)
 
-    def show_near(self, pet: QWidget) -> None:
-        """贴在桌宠左侧显示；窗口变高后可能顶出屏幕，这里统一收进可用区域。"""
-        area = pet.screen().availableGeometry(); point = pet.frameGeometry().topLeft() - QPoint(self.width() + 24, 150)
-        x = max(area.left() + 8, min(point.x(), area.right() - self.width() - 8))
-        y = max(area.top() + 8, min(point.y(), area.bottom() - self.height() - 8))
-        self.move(x, y); self.show(); self.raise_(); self.activateWindow()
+    def show_at(self, point: QPoint) -> None:
+        """在指定位置显示。落点由 PetWindow 按「设置 → 工具 → 对话窗口默认位置」算好。"""
+        self.move(point); self.show(); self.raise_(); self.activateWindow()
 
 
 CHAT_QSS = (
@@ -663,7 +665,7 @@ class FloatingInput(QWidget):
         self.place(); self.show(); self.raise_(); self.input.setFocus()
 
     def place(self) -> None:
-        """贴在角色下方；下方放不下就改放上方，别压在角色身上。"""
+        """贴在角色下方；下方放不下就改放上方，别压在角色身上（输入框不跟那些落点设置走）。"""
         area = self.pet.screen().availableGeometry()
         below = self.pet.y() + self.pet.height() + SPEECH_MARGIN
         above = self.pet.y() - self.height() - SPEECH_MARGIN
@@ -794,7 +796,7 @@ class PetWindow(QWidget):
         self.conversation.finished.connect(self._on_reply_finished)
         self.conversation.failed.connect(self._on_reply_failed)
         self.conversation.silenced.connect(self._on_reply_silenced)
-        self.chat = ChatDialog(None, self.conversation); self.speech = SpeechBubble(self); self.input_box = FloatingInput(self); self.input_box.submitted.connect(self._send_from_input); self.conversation.busy_changed.connect(self.input_box.set_busy); self._speech_timer = QTimer(self); self._speech_timer.setInterval(SPEECH_FLUSH_MS); self._speech_timer.timeout.connect(self._flush_speech); self.timer_window = TimerWindow(self, self.toggle_pomodoro, self.reset_pomodoro, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._follow_timer = QTimer(self); self._follow_timer.setInterval(FOLLOW_TICK_MS); self._follow_timer.timeout.connect(self._follow_step); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place(); self._resume_motion(); self._topmost_timer = QTimer(self); self._topmost_timer.setInterval(TOPMOST_CHECK_MS); self._topmost_timer.timeout.connect(self._keep_on_top); self._topmost_timer.start()
+        self.chat = ChatDialog(None, self.conversation); self.speech = SpeechBubble(self); self.input_box = FloatingInput(self); self.notes = NotesWindow(self, self._on_notes_write); self.input_box.submitted.connect(self._send_from_input); self.conversation.busy_changed.connect(self.input_box.set_busy); self._speech_timer = QTimer(self); self._speech_timer.setInterval(SPEECH_FLUSH_MS); self._speech_timer.timeout.connect(self._flush_speech); self.timer_window = TimerWindow(self, self.toggle_pomodoro, self.reset_pomodoro, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._follow_timer = QTimer(self); self._follow_timer.setInterval(FOLLOW_TICK_MS); self._follow_timer.timeout.connect(self._follow_step); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place(); self._resume_motion(); self._topmost_timer = QTimer(self); self._topmost_timer.setInterval(TOPMOST_CHECK_MS); self._topmost_timer.timeout.connect(self._keep_on_top); self._topmost_timer.start()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
     def _sync_geometry(self) -> None:
@@ -834,6 +836,7 @@ class PetWindow(QWidget):
         # 对话形式与对白透明度跟随设置（启动、换角色、保存设置都会走到这里）
         self._reply_form = str(data.get('conversation', {}).get('reply_form', FORM_WINDOW))
         self.speech.set_opacity(int(data.get('conversation', {}).get('bubble_opacity', SPEECH_OPACITY_DEFAULT)))
+        self.notes.set_opacity(int(data.get('tools', {}).get('notes_opacity', NOTES_OPACITY_DEFAULT)))
     def _on_conversation_busy(self, busy: bool) -> None:
         # 刚发出消息、还一个分片都没到的时候，先按"思考"处理
         if busy: self._reasoning = True; self.canvas.set_state('Think'); self.animation.stop()
@@ -860,7 +863,7 @@ class PetWindow(QWidget):
         """入口调用：有立绘就显示窗口，没有则隐藏并提示一次。"""
         if self.assets is not None:
             self._art_warned = None; self.show(); return
-        self.hide(); self.speech.dismiss(); self.input_box.hide()
+        self.hide(); self.speech.dismiss(); self.input_box.hide(); self.notes.hide()
         name, info = current_character(load_settings())
         folder = characters.sprite_dir(name, info) if name else None
         fingerprint = f"{name}|{folder}"
@@ -958,7 +961,7 @@ class PetWindow(QWidget):
         self._build_expression_menu(m)
         self._build_motion_menu(m)
         m.addSeparator()
-        self._add_conversation_action(m); a=m.addAction('停止番茄钟' if self.pomodoro_active else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.pomodoro_active else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
+        self._add_conversation_action(m); self._add_notes_action(m); a=m.addAction('停止番茄钟' if self.pomodoro_active else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.pomodoro_active else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
         return m
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
         # 菜单弹出期间挂个标记：看门狗这会儿不要重声明置顶，否则桌宠被提到菜单之上，
@@ -984,6 +987,13 @@ class PetWindow(QWidget):
             # 不报位置：那会在上下文里堆一串过时的方位，模型也用不上
             if math.hypot(moved.x(),moved.y())>=DRAG_EVENT_MIN_PIXELS:
                 self.conversation.notify_event('拖动', '用户拖动了你')
+    def hideEvent(self, event)->None:  # type: ignore[no-untyped-def]
+        # 角色被藏起来时，挂在它身边的小窗口跟着走：它们都是独立窗口，不会自动跟随。
+        # 番茄钟浮窗除外——它还代表着正在跑的计时，不该被一起收掉。
+        for name in ('speech', 'input_box', 'notes'):
+            widget = getattr(self, name, None)
+            if widget is not None: widget.hide()
+        super().hideEvent(event)
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
         if hasattr(self,'timer_window') and self.timer_window.isVisible(): self.timer_window.place()
         if hasattr(self,'speech'): self._place_floating()
@@ -1104,11 +1114,39 @@ class PetWindow(QWidget):
     def open_input(self) -> None:
         """托盘入口：打开当前这个对话形式。"""
         if self._reply_form == FORM_BUBBLE: self.input_box.open()
-        else: self.chat.show_near(self)
+        else: self._open_chat()
+    def notes_position(self) -> str:
+        """记事板每次打开的落点：角色旁 / 右下角 / 屏幕中间（设置 → 工具）。"""
+        return str(load_settings().get('tools', {}).get('notes_position', NOTES_POSITION_PET))
+    def notes_point(self, size: QSize, near: QPoint | None = None) -> QPoint:
+        """算出生记事板的落点，并统一收进可见区域。
+
+        只有记事板吃这项设置——对话窗与漂浮输入框始终贴着角色，它们跟对话形式绑定，
+        挪到屏幕角落反而别扭。``near`` 是「角色旁」时的理想位置（由记事板自己给）。
+        """
+        area = self.screen().availableGeometry()
+        mode = self.notes_position()
+        if mode == NOTES_POSITION_CORNER:
+            point = QPoint(area.right() - size.width() - WINDOW_MARGIN, area.bottom() - size.height() - WINDOW_MARGIN)
+        elif mode == NOTES_POSITION_CENTER:
+            point = QPoint(area.center().x() - size.width() // 2, area.center().y() - size.height() // 2)
+        else:
+            point = near if near is not None else self.frameGeometry().topLeft() - QPoint(size.width() + WINDOW_MARGIN, 150)
+        x = max(area.left() + 8, min(point.x(), area.right() - size.width() - 8))
+        y = max(area.top() + 8, min(point.y(), area.bottom() - size.height() - 8))
+        return QPoint(x, y)
+    def _open_chat(self) -> None:
+        """打开对话窗：贴在角色左侧（位置与「记事板窗口位置」无关）。"""
+        area = self.screen().availableGeometry()
+        size = self.chat.size()
+        point = self.frameGeometry().topLeft() - QPoint(size.width() + WINDOW_MARGIN, 150)
+        x = max(area.left() + 8, min(point.x(), area.right() - size.width() - 8))
+        y = max(area.top() + 8, min(point.y(), area.bottom() - size.height() - 8))
+        self.chat.show_at(QPoint(x, y))
     def toggle_input(self) -> None:
         """右键入口：漂浮输入框开 / 收。"""
         if self._reply_form != FORM_BUBBLE:
-            self.chat.hide() if self.chat.isVisible() else self.chat.show_near(self); return
+            self.chat.hide() if self.chat.isVisible() else self._open_chat(); return
         self.input_box.hide() if self.input_box.isVisible() else self.input_box.open()
     def _add_conversation_action(self, menu: QMenu) -> None:
         """右键菜单里的"打开对话"入口，按当前形式决定开哪一个。"""
@@ -1118,7 +1156,22 @@ class PetWindow(QWidget):
             return
         opened = self.chat.isVisible()
         action = menu.addAction('关闭对话框' if opened else '打开对话框')
-        action.triggered.connect(self.close_chat if opened else lambda: self.chat.show_near(self))
+        action.triggered.connect(self.close_chat if opened else self._open_chat)
+    def _add_notes_action(self, menu: QMenu) -> None:
+        """右键菜单里的记事板入口。"""
+        opened = self.notes.isVisible()
+        action = menu.addAction('收起记事板' if opened else '打开记事板')
+        action.triggered.connect(self.toggle_notes)
+    def toggle_notes(self) -> None:
+        """记事板开 / 收。"""
+        self.notes.hide() if self.notes.isVisible() else self.notes.open()
+    def _on_notes_write(self) -> None:
+        """记事板写入了：只告诉模型"有人在记事板上写了字"，正文不出门。
+
+        冷却交给事件层（``service.EVENT_COOLDOWN`` 里记事板是 10 秒），所以连写一阵
+        也只会偶尔提一次。
+        """
+        self.conversation.notify_event('记事板', '用户在记事板上写了几笔（你看不到具体内容）')
     def _place_floating(self) -> None:
         """跟随角色移动：对白在角色上方、输入框在角色下方。"""
         if hasattr(self, 'speech') and self.speech.isVisible(): self.speech.place()
