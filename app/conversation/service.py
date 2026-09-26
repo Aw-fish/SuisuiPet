@@ -20,7 +20,14 @@ from app import devtools
 from app.conversation import prompts
 from app.conversation.consolidation import consolidate_pending
 from app.conversation.memory import MemoryStore
-from app.conversation.message import Message, ROLE_ASSISTANT, ROLE_USER
+from app.conversation.message import (
+    SILENT_MARK,
+    Message,
+    ROLE_ASSISTANT,
+    ROLE_USER,
+    is_silent,
+    silent_pending,
+)
 from app.conversation.providers.base import LLMProvider, ProviderError
 from app.conversation.providers.openai_compat import OpenAICompatProvider
 from app.conversation.sentence import SentenceSplitter
@@ -29,6 +36,12 @@ from app.pet.emotion import EXPRESSION_HINT, TagFilter, mood_asset
 DEFAULT_LIMIT = 20
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TIMEOUT = 60
+#: 同类事件两次转发之间至少隔多久。只对下面 COOLDOWN_TAGS 里的事件生效。
+EVENT_COOLDOWN_SECONDS = 20
+#: 需要冷却的事件：拖动会在松手时反复触发（随手挪一下也算），每个事件都是一次真实
+#: 请求，不拦一下会烧掉大量调用。番茄钟与模式切换都是明确的单次动作——来了就该告诉
+#: 模型，否则"开始专注 → 十分钟后暂停"这种前后关系就断了。
+COOLDOWN_TAGS = frozenset({"拖动"})
 
 
 def _as_float(value: Any, fallback: float) -> float:
@@ -205,6 +218,8 @@ class ConversationService(QObject):
     consolidation_failed = Signal(str)
     #: 回复里标出的表情（立绘素材名，None 表示回到默认立绘）
     mood_changed = Signal(object)
+    #: 这一轮模型明确表示"不作回应"（SILENT_MARK）：界面不显示，但历史与日志里留着
+    silenced = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -223,6 +238,12 @@ class ConversationService(QObject):
         #: 本次请求的时间基准，用来算首字延迟与总耗时（只给开发者面板看）
         self._started_at: float | None = None
         self._first_delta_at: float | None = None
+        #: 已经放给下游的正文长度（见 _emit_visible：正文前缀要先按住看是不是 SILENT_MARK）
+        self._emitted = 0
+        #: 正文是不是已经开始了，但还没找到机会放出来（"思考 → 说话"的切换就此推迟）
+        self._talk_pending = False
+        #: 每类事件上次转发的时间，用于冷却（只影响事件，不影响正常对话）
+        self._event_at: dict[str, float] = {}
 
     # ---- 配置 ---------------------------------------------------------------
 
@@ -311,15 +332,56 @@ class ConversationService(QObject):
         if self._memory is None:
             self.failed.emit("还没有选择角色")
             return
-        provider = build_provider(self._info)
+        provider = self._provider()
         if provider is None:
-            devtools.log.warning("对话 · 无法发送：没有配置 API 地址或模型名称")
-            self.failed.emit("没有配置 API 地址或模型名称，请到设置 → 角色设置里填写")
             return
+        self._start(provider, self._memory.append_user(text), query=text)
+
+    def notify_event(self, tag: str, text: str = "") -> bool:
+        """把一次用户操作（拖动 / 番茄钟 / 跟随）作为**事件**交给模型，返回是否发出去了。
+
+        事件与对话的区别：模型可以顺着它说一句，也可以不作回应（输出
+        :data:`SILENT_MARK`，本地捕获后界面上什么都不显示）。两种情况下直接丢掉：
+
+        * 上一轮还在生成——事件是"刚刚发生"的事，排队只会让模型面对一串过期动作；
+        * :data:`COOLDOWN_TAGS` 里的事件（目前只有拖动）在 ``EVENT_COOLDOWN_SECONDS``
+          秒内已经发过——拖动每次松手都可能触发，不拦一下会烧掉大量调用。
+        """
+        if self._memory is None or self.busy:
+            return False
+        now = time.monotonic()
+        if tag in COOLDOWN_TAGS and now - self._event_at.get(tag, 0.0) < EVENT_COOLDOWN_SECONDS:
+            return False
+        provider = self._provider(report=False)
+        if provider is None:
+            return False
+        self._event_at[tag] = now
+        label = f"[{tag}] {text}".strip()
+        devtools.log.info("事件 · %s（交给模型，可回应可不回应）", label)
+        self._start(provider, self._memory.append_event(label), query="")
+        return True
+
+    def _provider(self, report: bool = True) -> LLMProvider | None:
+        """取出这一轮要用的 provider；没配好就返回 None。
+
+        ``report`` 为假时只写日志、不发失败信号——事件不该因为没配 API 就弹个错误出来。
+        """
+        provider = build_provider(self._info)
+        if provider is not None:
+            return provider
+        devtools.log.warning("对话 · 无法发送：没有配置 API 地址或模型名称")
+        if report:
+            self.failed.emit("没有配置 API 地址或模型名称，请到设置 → 角色设置里填写")
+        return None
+
+    def _start(self, provider: LLMProvider, user_message: Message, query: str) -> None:
+        """把一轮请求真正发出去：重置状态 → 记录参数 → 组装上下文 → 起线程。"""
+        assert self._memory is not None          # 两个调用方都先查过
         self._tag_filter.reset()
         self._clean.clear()
         self._tag_count = 0
-        user_message = self._memory.append_user(text)
+        self._emitted = 0
+        self._talk_pending = False
         # 参数先记录、再组装上下文：面板按发生顺序铺开，卡片头要排在"这一轮发了什么"前面
         devtools.record(
             "request",
@@ -329,10 +391,12 @@ class ConversationService(QObject):
             context_limit=self._context_limit(),
             # 这一轮新挂了时间行（面板据此在分隔线上标一句，说明从这里重新"对表"）
             narration=user_message.narration,
+            # 事件轮：这条不是用户说的话，面板要区分开
+            event=user_message.event,
         )
-        # 把用户这句话交给记忆检索，召回与当前话题相关的长期记忆
+        # 把这一轮的内容交给记忆检索，召回与当前话题相关的长期记忆
         messages = self._memory.build_context(
-            self._system_prompt(), self._context_limit(), text, self._runtime_notes()
+            self._system_prompt(), self._context_limit(), query, self._runtime_notes()
         )
         self._started_at = time.monotonic()
         self._first_delta_at = None
@@ -376,15 +440,37 @@ class ConversationService(QObject):
         if not clean:
             return
         self._clean.append(clean)
-        self.delta.emit(clean)
-        for sentence in self._splitter.feed(clean):
+        self._emit_visible()
+
+    def _emit_visible(self) -> None:
+        """把已累计的正文里"确定不是「不作回应」"的部分放给下游。
+
+        ``SILENT_MARK`` 是逐字流进来的：直接转发会让界面先闪出"（不做"再消失，
+        所以前几个字先按住，确认它不可能凑成这个标记之后再放行（顺带让桌宠的 Talk
+        动作也不会为一次"不作回应"抖一下）。
+        """
+        text = "".join(self._clean)
+        if silent_pending(text):
+            return
+        tail = text[self._emitted:]
+        if not tail:
+            return
+        self._emitted = len(text)
+        if self._talk_pending:
+            # 正文真的开始了，这时候才把桌宠从"思考"切到"说话"
+            self._talk_pending = False
+            devtools.preview("reasoning_done")
+            self.reasoning_changed.emit(False)
+        self.delta.emit(tail)
+        for sentence in self._splitter.feed(tail):
             self.sentence.emit(sentence)
 
     def _on_reasoning_changed(self, reasoning: bool) -> None:
-        # 正文一开始，就让开发者面板把"深度思考"收起来（跟主流 AI 前端一个做法）
-        if not reasoning:
-            devtools.preview("reasoning_done")
-        self.reasoning_changed.emit(reasoning)
+        if reasoning:
+            self.reasoning_changed.emit(True)
+            return
+        # 正文开始：先记着，等真有可展示的文字时再放出去（见 _emit_visible）
+        self._talk_pending = True
 
     def _on_reasoning_delta(self, text: str) -> None:
         """推理内容的限频预览：只喂开发者面板，不进记忆、也不进对话界面。"""
@@ -413,9 +499,18 @@ class ConversationService(QObject):
         interrupted = bool(worker is not None and worker.cancelled)
         #: 推理内容也算这一次的产出（推理模型可能几千 token 都在这里）
         reasoning = worker.reasoning if worker is not None else ""
-        if self._memory is not None and (text or interrupted):
+        # 模型明确表示"不作回应"（事件轮常见）：界面什么都不显示，但这一轮照样留在
+        # 历史与日志里——上下文不断档，翻日志也看得出它看到了什么、选择了什么
+        silent = not error and not interrupted and is_silent(text)
+        if silent:
+            text = ""
+        if self._memory is not None and (text or interrupted or silent):
             self._memory.append(
-                Message(role=ROLE_ASSISTANT, content=text, interrupted=interrupted)
+                Message(
+                    role=ROLE_ASSISTANT,
+                    content=SILENT_MARK if silent else text,
+                    interrupted=interrupted,
+                )
             )
         first = total = 0.0
         if self._started_at is not None:
@@ -430,6 +525,7 @@ class ConversationService(QObject):
             raw=raw,
             reasoning=reasoning,
             tags=self._tag_count,
+            silent=silent,
             interrupted=interrupted,
             error=error,
             first_token_ms=round(first * 1000),
@@ -443,6 +539,8 @@ class ConversationService(QObject):
             notes = f"，其中思考 {reasoning_tokens}" if reasoning_tokens else ""
             if interrupted:
                 notes += "，被打断"
+            if silent:
+                notes += "，未作回应"
             devtools.log.info(
                 "对话 · 回复完成（用时 %.2fs，首字 %.2fs，约 %d token%s）",
                 total,
@@ -453,6 +551,9 @@ class ConversationService(QObject):
         self.busy_changed.emit(False)
         if error:
             self.failed.emit(error)
+        elif silent:
+            devtools.log.info("对话 · 未作回应（已记入会话日志，界面不显示）")
+            self.silenced.emit()
         else:
             self.finished.emit(text)
 

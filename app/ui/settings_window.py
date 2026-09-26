@@ -112,6 +112,8 @@ class ComboBox(QComboBox):
 
 class SettingsWindow(QMainWindow):
     settings_saved = Signal(dict)
+    #: 托盘菜单里的「打开对话」：由 PetWindow 按当前对话形式决定开哪一个
+    input_requested = Signal()
     #: 记忆被清空后转发出去，由主窗口同步对话窗
     memory_reset = Signal()
     ACCENT = "#917DE8"
@@ -351,6 +353,19 @@ class SettingsWindow(QMainWindow):
     def _on_auto_expression_toggled(self, checked: bool) -> None:
         self.expression_sensitivity.setEnabled(checked)
 
+    def _on_form_toggled(self, checked: bool) -> None:
+        """对白时长与不透明度都只有漂浮形式上才用得到。"""
+        self.bubble_seconds.setEnabled(checked)
+        self.bubble_seconds_value.setEnabled(checked)
+        self.bubble_opacity.setEnabled(checked)
+        self.bubble_opacity_value.setEnabled(checked)
+
+    def _on_bubble_seconds_changed(self, value: int) -> None:
+        self.bubble_seconds_value.setText(f"{value} 秒")
+
+    def _on_bubble_opacity_changed(self, value: int) -> None:
+        self.bubble_opacity_value.setText(f"{value}%")
+
     def _mode_page(self) -> QWidget:
         page, layout = self._page("模式设置", "控制角色在桌面上的行为，以及对所有角色生效的对话风格。")
         layout.addWidget(self._label("角色动作模式"))
@@ -384,6 +399,46 @@ class SettingsWindow(QMainWindow):
         self.sensitivity_hint = QLabel("", objectName="hint")
         self.sensitivity_hint.setWordWrap(True)
         layout.addWidget(self.sensitivity_hint)
+        layout.addSpacing(20)
+        layout.addWidget(self._label("对话形式"))
+        self.form_window, self.form_bubble = QRadioButton("聊天窗口"), QRadioButton("漂浮输入框 + 对白气泡")
+        self.form_group = QButtonGroup(self)
+        self.form_group.addButton(self.form_window); self.form_group.addButton(self.form_bubble)
+        self.form_bubble.toggled.connect(self._on_form_toggled)
+        layout.addWidget(self.form_window)
+        layout.addWidget(QLabel("独立的聊天窗口，历史最完整。", objectName="hint"))
+        layout.addWidget(self.form_bubble)
+        layout.addWidget(QLabel("在角色旁打字，回复显示在角色上方的对白框里（同一段会话）。", objectName="hint"))
+        layout.addWidget(self._label("对白停留时长"))
+        hold_row = QHBoxLayout()
+        hold_row.setSpacing(10)
+        self.bubble_seconds = QSlider(Qt.Horizontal)
+        self.bubble_seconds.setRange(3, 30)
+        self.bubble_seconds.setSingleStep(1)
+        self.bubble_seconds.setFixedHeight(24)
+        self.bubble_seconds.valueChanged.connect(self._on_bubble_seconds_changed)
+        self.bubble_seconds_value = QLabel(objectName="chip")
+        self.bubble_seconds_value.setAlignment(Qt.AlignCenter)
+        self.bubble_seconds_value.setFixedWidth(52)
+        hold_row.addWidget(self.bubble_seconds, 1)
+        hold_row.addWidget(self.bubble_seconds_value)
+        layout.addLayout(hold_row)
+        layout.addWidget(QLabel("对白几秒后自动消失；新回复直接覆盖它，点一下对白也能立刻关掉。", objectName="hint"))
+        layout.addWidget(self._label("对白不透明度"))
+        alpha_row = QHBoxLayout()
+        alpha_row.setSpacing(10)
+        self.bubble_opacity = QSlider(Qt.Horizontal)
+        self.bubble_opacity.setRange(30, 100)
+        self.bubble_opacity.setSingleStep(1)
+        self.bubble_opacity.setFixedHeight(24)
+        self.bubble_opacity.valueChanged.connect(self._on_bubble_opacity_changed)
+        self.bubble_opacity_value = QLabel(objectName="chip")
+        self.bubble_opacity_value.setAlignment(Qt.AlignCenter)
+        self.bubble_opacity_value.setFixedWidth(52)
+        alpha_row.addWidget(self.bubble_opacity, 1)
+        alpha_row.addWidget(self.bubble_opacity_value)
+        layout.addLayout(alpha_row)
+        layout.addWidget(QLabel("越高越不透明（30%~100%），只影响角色上方那个对白框。", objectName="hint"))
         layout.addSpacing(20)
         layout.addWidget(self._label("全局提示词（对所有角色生效）"))
         self.base_prompt = QTextEdit()
@@ -720,6 +775,22 @@ class SettingsWindow(QMainWindow):
             sensitivity = DEFAULT_SENSITIVITY
         self.expression_sensitivity.setValue(max(1, min(10, sensitivity)))
         self._on_sensitivity_changed(self.expression_sensitivity.value())
+        form = str(a.get("reply_form", "window"))
+        self.form_bubble.setChecked(form == "bubble")
+        self.form_window.setChecked(form != "bubble")
+        try:
+            hold = int(a.get("bubble_seconds", 8))
+        except (TypeError, ValueError):
+            hold = 8
+        self.bubble_seconds.setValue(max(3, min(30, hold)))
+        self._on_bubble_seconds_changed(self.bubble_seconds.value())
+        try:
+            opacity = int(a.get("bubble_opacity", 80))
+        except (TypeError, ValueError):
+            opacity = 80
+        self.bubble_opacity.setValue(max(30, min(100, opacity)))
+        self._on_bubble_opacity_changed(self.bubble_opacity.value())
+        self._on_form_toggled(self.form_bubble.isChecked())
         self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
         self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
         # 开发者开关：这里只同步界面，真正开启由 PetWindow 按同样的设置执行，
@@ -743,6 +814,9 @@ class SettingsWindow(QMainWindow):
         self.data["conversation"]["base_prompt"] = self.base_prompt.toPlainText().strip() or BASE_SYSTEM_PROMPT
         self.data["conversation"]["auto_expression"] = self.auto_expression.isChecked()
         self.data["conversation"]["expression_sensitivity"] = self.expression_sensitivity.value()
+        self.data["conversation"]["reply_form"] = "bubble" if self.form_bubble.isChecked() else "window"
+        self.data["conversation"]["bubble_seconds"] = self.bubble_seconds.value()
+        self.data["conversation"]["bubble_opacity"] = self.bubble_opacity.value()
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({"pomodoro_minutes": self.pomodoro.value(), "weather_city": self.city.text().strip()})
         self.data.setdefault("developer", {})["enabled"] = self.developer_enabled.isChecked()
@@ -758,8 +832,9 @@ class SettingsWindow(QMainWindow):
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(app_icon(), self); self.tray.setToolTip("SuisuiPet")
         menu = styled_menu(self); open_action = QAction("打开设置", self); open_action.triggered.connect(self.show_from_tray)
+        chat_action = QAction("打开对话", self); chat_action.triggered.connect(self.input_requested.emit)
         quit_action = QAction("退出", self); quit_action.triggered.connect(QApplication.instance().quit)
-        menu.addAction(open_action); menu.addSeparator(); menu.addAction(quit_action); self.tray.setContextMenu(menu); self.tray.show()
+        menu.addAction(open_action); menu.addAction(chat_action); menu.addSeparator(); menu.addAction(quit_action); self.tray.setContextMenu(menu); self.tray.show()
 
     def notify(self, title: str, text: str) -> None:
         """弹一条系统通知（走托盘图标）。平台不支持气泡时静默跳过，不影响调用方。"""

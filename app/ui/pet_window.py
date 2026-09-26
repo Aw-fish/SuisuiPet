@@ -1,7 +1,9 @@
 """Interactive desktop pet window and its floating utilities."""
 from __future__ import annotations
+import ctypes
 import math
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -10,7 +12,7 @@ from PySide6.QtGui import QActionGroup, QContextMenuEvent, QCursor, QFontMetrics
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 from app import characters, devtools
 from app.config import load_settings, save_settings
-from app.conversation.message import ROLE_ASSISTANT, ROLE_USER
+from app.conversation.message import ROLE_ASSISTANT, ROLE_USER, is_silent
 from app.conversation.service import ConversationService
 from app.pet.animator import SpriteAnimator
 from app.pet.character_sprite import CharacterAssets
@@ -26,6 +28,8 @@ BUBBLE_HEIGHT = 34
 DEFAULT_CANVAS_SIZE = QSize(168, 168)
 #: 打开对话窗时最多恢复多少条历史
 HISTORY_LIMIT = 30
+#: 拖动超过这么多像素才算一次「拖动」事件：随手点一下、抖几像素不该去打扰模型
+DRAG_EVENT_MIN_PIXELS = 48
 #: 对话窗尺寸（竖长比例，贴近手机聊天界面）
 CHAT_SIZE = QSize(400, 600)
 #: 单个气泡最多占消息区宽度的比例
@@ -37,6 +41,22 @@ BUBBLE_PADDING = 26
 BUBBLE_SLACK = 8
 #: 单条气泡的最小宽度
 BUBBLE_MIN_WIDTH = 52
+
+#: 对话形式：``window`` 聊天窗口 / ``bubble`` 漂浮输入框 + 角色上方的对白气泡
+FORM_WINDOW, FORM_BUBBLE = "window", "bubble"
+#: 对白气泡：窗口宽度上下限，以及"文字量 → 窗口尺寸"换算用的内边距与留量
+SPEECH_MAX_WIDTH = 300
+SPEECH_MIN_WIDTH = 110
+SPEECH_PADDING = 32          # 左右内边距合计 + 边框
+SPEECH_VPADDING = 22         # 上下内边距合计 + 边框
+SPEECH_SLACK = 8             # 与对话窗同样的道理：QLabel 折行判定比度量值多吃几像素
+#: 对白气泡与角色之间的留白，以及番茄钟浮窗显示时与它之间的留白
+SPEECH_MARGIN = 10
+SPEECH_TIMER_GAP = 8
+#: 漂浮输入框尺寸
+INPUT_SIZE = QSize(280, 46)
+#: 对白气泡按 40ms 抽帧刷新：服务是逐块推进增量的，每块都重排一次会抖
+SPEECH_FLUSH_MS = 40
 
 ACTIVITY_MIN, ACTIVITY_MAX, ACTIVITY_DEFAULT = 1, 10, 5
 
@@ -63,6 +83,14 @@ FOLLOW_MARGIN = 36
 #: 它们只是"我知道了"，是原来时长的一半，不必一直挡在那；要看清的（任务完成）在调用处
 #: 显式给更长的值。
 SAY_MS = 1150
+
+#: 重新声明「我是置顶窗口」的间隔（毫秒）。别的程序抢 z 序、或全屏程序来回切换之后，
+#: 置顶属性可能被顶掉，桌宠就沉到别人窗口后面去了——"操作一阵子就被盖住"就是这么来的。
+TOPMOST_CHECK_MS = 1500
+
+#: 给 SetWindowPos 用的常量：放进"置顶"那一层，且不改尺寸、不动位置、不抢焦点
+_HWND_TOPMOST = -1
+_SWP_KEEP = 0x0001 | 0x0002 | 0x0010
 
 #: 身上带着情绪表情时，随机移动的概率乘以这个系数。
 #: 表情只在待机时露脸，一走起来就被 Move 素材盖住了，所以有表情时让它多待一会儿
@@ -236,6 +264,7 @@ class ChatDialog(QDialog):
         conversation.finished.connect(self._on_finished)
         conversation.failed.connect(self._on_failed)
         conversation.busy_changed.connect(self._on_busy_changed)
+        conversation.silenced.connect(self._on_silenced)
 
     # ---- 消息渲染 -----------------------------------------------------------
 
@@ -302,9 +331,11 @@ class ChatDialog(QDialog):
         """把最近的会话渲染出来，重启后仍能看到上下文。"""
         self.clear()
         for message in messages:
-            if message.role == ROLE_USER:
+            # 事件行与"不作回应"都不进聊天界面：它们只留在请求、会话日志与开发者面板里，
+            # 重新打开聊天窗口时也不该冒出来
+            if message.role == ROLE_USER and not message.event:
                 self.add(message.content, True)
-            elif message.role == ROLE_ASSISTANT and message.content:
+            elif message.role == ROLE_ASSISTANT and message.content and not is_silent(message.content):
                 self.add(message.content + ("（已打断）" if message.interrupted else ""), False)
         self._follow = True
         self._scroll_to_bottom()
@@ -369,7 +400,8 @@ class ChatDialog(QDialog):
         self.send_button.style().polish(self.send_button)
         if busy:
             self._buffer = ""
-            self._stream_label = self.add("", False)
+            # 消息等真有字再落（见 _flush_stream）：这样"不作回应"的一轮不会留下空壳
+            self._stream_label = None
             self.status.setText("正在输入…")
             self._reset_timer.start()
         else:
@@ -381,10 +413,13 @@ class ChatDialog(QDialog):
         self._buffer += text
 
     def _flush_stream(self) -> None:
+        text = self._buffer.strip()
+        if not text:
+            return
         label = self._stream_label
         if label is None:
-            return
-        text = self._buffer.strip()
+            # 第一段正文到了才落这条消息：没有字的一轮（比如"不作回应"）就不留空壳
+            label = self._stream_label = self.add("", False)
         if label.text() == text:
             return
         label.setText(text)
@@ -411,6 +446,12 @@ class ChatDialog(QDialog):
         self.status.setText("")
         # 一条完整回复落地，等同于来了一条新消息，直接跳到底部
         self._scroll_to_bottom(force=True)
+
+    def _on_silenced(self) -> None:
+        """模型对事件选择"不作回应"：界面不留任何痕迹（连空消息壳也不落）。"""
+        self._reset_timer.stop()
+        self._stream_label = None
+        self.status.setText("")
 
     def _on_failed(self, message: str) -> None:
         self._reset_timer.stop()
@@ -471,11 +512,195 @@ CHAT_QSS = (
 )
 
 
+#: 对白气泡背景的不透明度（百分比）取值范围与默认值。设置项是 ``conversation.bubble_opacity``，
+#: 两端都要夹一下：低于 30% 基本看不清字了。
+SPEECH_OPACITY_MIN, SPEECH_OPACITY_MAX, SPEECH_OPACITY_DEFAULT = 30, 100, 80
+
+
+def speech_qss(opacity: int = SPEECH_OPACITY_DEFAULT) -> str:
+    """对白气泡的样式：背景半透明，不透明度按设置来（百分比 → 0~255）。"""
+    alpha = max(0, min(255, round(255 * opacity / 100)))
+    return (
+        f'QFrame#speechRoot {{ background:rgba(255,255,255,{alpha}); border:1px solid rgba(232,228,242,{alpha}); border-radius:14px; }}'
+        'QLabel#speechText { color:#4B4560; font-size:12px; background:transparent; }'
+    )
+
+INPUT_QSS = (
+    'QFrame#inputRoot { background:rgba(255,255,255,244); border:1px solid #E8E4F2; border-radius:14px; }'
+    'QTextEdit#floatInput { background:transparent; border:0; color:#4B4560; font-size:12px; }'
+    'QPushButton#floatSend { background:#EFEAF9; color:#6D5DC0; border:0; border-radius:9px; padding:6px 10px; }'
+    'QPushButton#floatSend:hover { background:#E5DDF7; }'
+    'QPushButton#floatClose { background:transparent; color:#B4AEC4; border:0; font-size:14px; }'
+    'QPushButton#floatClose:hover { color:#6D5DC0; }'
+)
+
+
+class SpeechBubble(QWidget):
+    """角色上方的对白框：随文字多少变高变宽，几秒后消失或被新回答覆盖。
+
+    做成独立小窗口（认桌宠当 parent）而不是塞进桌宠窗口：桌宠窗口只有"立绘 + 顶部
+    一条固定高度的气泡带"，放不下长短不一的对白。子窗口既不会被父窗口裁剪，也天然
+    和角色同属一层、一起显隐；点一下它就能立刻收掉。
+    """
+
+    def __init__(self, pet: QWidget) -> None:
+        super().__init__(pet)
+        self.pet = pet
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        root = QFrame(objectName="speechRoot")
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(root)
+        inner = QVBoxLayout(root); inner.setContentsMargins(15, 10, 15, 10)
+        self.label = QLabel("", objectName="speechText"); self.label.setWordWrap(True)
+        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # 固定宽度 + heightForWidth，折行之后高度才算得准（与对话窗里的气泡同一套做法）
+        policy = QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum); policy.setHeightForWidth(True)
+        self.label.setSizePolicy(policy)
+        inner.addWidget(self.label)
+        self.set_opacity(SPEECH_OPACITY_DEFAULT)
+        self._timer = QTimer(self); self._timer.setSingleShot(True); self._timer.timeout.connect(self.hide)
+
+    def set_opacity(self, percent: int) -> None:
+        """按设置调整背景不透明度（百分比，两端夹一下）。"""
+        self.setStyleSheet(speech_qss(max(SPEECH_OPACITY_MIN, min(SPEECH_OPACITY_MAX, int(percent)))))
+
+    def _label_width(self, text: str) -> int:
+        """标签宽度：按"整条文本排成一行"来量，封顶上限；放不下就交给 QLabel 折行。"""
+        metrics = QFontMetrics(self.label.font())
+        natural = metrics.horizontalAdvance(text or " ") + SPEECH_SLACK
+        low = SPEECH_MIN_WIDTH - SPEECH_PADDING
+        high = SPEECH_MAX_WIDTH - SPEECH_PADDING
+        return max(low, min(high, natural))
+
+    def show_text(self, text: str, hold_ms: int = 0) -> None:
+        """显示一段对白；``hold_ms`` > 0 时到点自动消失，0 表示先留着（流式期间）。"""
+        text = text.strip()
+        if not text:
+            return
+        width = self._label_width(text)
+        self.label.setText(text)
+        self.label.setFixedWidth(width)
+        # 自己按折行结果算窗口大小（不依赖布局的 sizeHint）：文字多少直接决定窗口多大
+        self.setFixedSize(width + SPEECH_PADDING, self.label.heightForWidth(width) + SPEECH_VPADDING)
+        self.place()
+        self.show(); self.raise_()
+        self._timer.stop()
+        if hold_ms > 0:
+            self._timer.start(hold_ms)
+
+    def place(self) -> None:
+        """贴在角色头顶上方；顶出屏幕（或上方放不下）就向下收进可见区域。
+
+        基准取"立绘的顶"（``pet.y() + BUBBLE_HEIGHT``）而不是窗口顶：窗口顶上还有一条
+        提示带，按窗口顶算会让对白离角色脑袋远一截。番茄钟浮窗也在这一带，它让位给对白
+        （见 :meth:`TimerWindow.place`），所以对白长高 / 收起来之后要叫它重新摆一次。
+        """
+        area = self.pet.screen().availableGeometry()
+        x = self.pet.x() + (self.pet.width() - self.width()) // 2
+        y = self.pet.y() + BUBBLE_HEIGHT - self.height() - SPEECH_MARGIN
+        x = max(area.left() + 8, min(x, area.right() - self.width() - 8))
+        y = max(area.top() + 8, min(y, area.bottom() - self.height() - 8))
+        self.move(x, y)
+        timer = getattr(self.pet, 'timer_window', None)
+        if timer is not None and timer.isVisible(): timer.place()
+
+    def hideEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        # 对白收起来了，让位抬高的番茄钟要放回原位
+        timer = getattr(self.pet, 'timer_window', None)
+        if timer is not None and timer.isVisible(): timer.place()
+        super().hideEvent(event)
+
+    def dismiss(self) -> None:
+        self._timer.stop(); self.hide()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        # 点一下就走：对白本来就是"看过就算"的东西
+        self.dismiss()
+
+
+class FloatingInput(QWidget):
+    """贴在角色下方的漂浮输入框：Enter 发送、Esc 或 ✕ 收起。
+
+    与对白框分工：对白在角色上方、输入在角色下方，两者不打架。
+    """
+
+    submitted = Signal(str)
+
+    def __init__(self, pet: QWidget) -> None:
+        super().__init__(pet)
+        self.pet = pet
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(INPUT_SIZE)
+        root = QFrame(objectName="inputRoot")
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(root)
+        row = QHBoxLayout(root); row.setContentsMargins(10, 6, 8, 6); row.setSpacing(6)
+        self.input = ChatInput(objectName="floatInput")
+        self.input.setPlaceholderText("说点什么……（Enter 发送，Esc 收起）")
+        self.input.submitted.connect(self._on_submit)
+        self.input.installEventFilter(self)          # Esc 收起（QTextEdit 不处理 Esc，得自己接）
+        self.button = QPushButton("发送", objectName="floatSend")
+        self.button.clicked.connect(self._on_submit)
+        close = QPushButton("×", objectName="floatClose"); close.setToolTip("收起输入框")
+        close.setFixedWidth(20); close.clicked.connect(self.hide)
+        row.addWidget(self.input, 1); row.addWidget(self.button); row.addWidget(close)
+        self.setStyleSheet(INPUT_QSS)
+
+    def _on_submit(self) -> None:
+        """发送；正在生成中时同一个按钮变成"停止"（与对话窗的按钮一致）。"""
+        if self.pet.conversation.busy:
+            self.pet.conversation.interrupt(); return
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        self.input.clear()
+        self.submitted.emit(text)
+
+    def set_busy(self, busy: bool) -> None:
+        self.button.setText("停止" if busy else "发送")
+
+    def open(self) -> None:
+        self.place(); self.show(); self.raise_(); self.input.setFocus()
+
+    def place(self) -> None:
+        """贴在角色下方；下方放不下就改放上方，别压在角色身上。"""
+        area = self.pet.screen().availableGeometry()
+        below = self.pet.y() + self.pet.height() + SPEECH_MARGIN
+        above = self.pet.y() - self.height() - SPEECH_MARGIN
+        y = below if below + self.height() <= area.bottom() - 8 else above
+        x = self.pet.x() + (self.pet.width() - self.width()) // 2
+        x = max(area.left() + 8, min(x, area.right() - self.width() - 8))
+        y = max(area.top() + 8, min(y, area.bottom() - self.height() - 8))
+        self.move(x, y)
+
+    def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
+        if watched is self.input and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            self.hide(); return True
+        return super().eventFilter(watched, event)
+
+
+def _reassert_topmost(window: QWidget) -> None:
+    """重新声明某个窗口是「置顶」。
+
+    ``raise_()`` 只能在当前层里往前挤，救不回已经被顶掉的置顶属性；Windows 上直接
+    ``SetWindowPos(HWND_TOPMOST)`` 既重写属性，又不动尺寸位置、也不抢焦点
+    （``SWP_NOACTIVATE``），是这件事最直接的做法。非 Windows 退回 ``raise_()``。
+    """
+    if sys.platform == 'win32':
+        try:
+            ctypes.windll.user32.SetWindowPos(int(window.winId()), _HWND_TOPMOST, 0, 0, 0, 0, _SWP_KEEP)
+            return
+        except Exception:  # pragma: no cover - 平台异常时退回 Qt 自己的手段
+            devtools.log.warning('重新置顶失败，退回 raise()', exc_info=True)
+    window.raise_()
+
+
 class TimerWindow(QWidget):
     def __init__(self, pet: QWidget, pause: Callable[[], None], reset: Callable[[], None], stop: Callable[[], None]) -> None:
-        # 不设 WindowStaysOnTopHint：置顶只留给桌宠。两个都置顶时，后弹出来的浮窗
-        # 会盖住桌宠（同层级里后 raise 的在上）。
-        super().__init__(); self.pet = pet; self.setFixedSize(212, 62); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool); self.setAttribute(Qt.WA_TranslucentBackground)
+        # 认桌宠当 parent（+ 自己也置顶），是为了让浮窗和角色**同属一层**：Qt 与 Windows
+        # 都保证子窗口在父窗口之上，所以相对关系永远稳定——不会时而人物压住浮窗、时而
+        # 浮窗压住人物；顺带还能跟着桌宠一起显示与隐藏。
+        super().__init__(pet); self.pet = pet; self.setFixedSize(212, 62); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         root = QFrame(objectName="timerRoot"); layout = QHBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(root); inner = QHBoxLayout(root); inner.setContentsMargins(12, 8, 10, 8); inner.setSpacing(6)
         self.label = QLabel("25:00", objectName="timerLabel")
         self.pause = QPushButton("暂停", objectName="timerBtn"); self.pause.clicked.connect(pause)
@@ -486,7 +711,12 @@ class TimerWindow(QWidget):
         self.setStyleSheet('QFrame#timerRoot { background:rgba(255,255,255,235); border:1px solid #E8E4F2; border-radius:14px; } QLabel#timerLabel { color:#5C5275; font-weight:600; } QPushButton#timerBtn { background:#F2EFF9; color:#73688F; border:0; border-radius:8px; padding:6px 8px; } QPushButton#timerBtn:hover { background:#E9E3F7; }')
 
     def place(self) -> None:
-        point = self.pet.frameGeometry().topLeft() - QPoint(0, self.height() + 8); self.move(point)
+        """贴在角色头顶上方；对白正在显示时抬到它上面——番茄钟压对白，对白压角色。"""
+        point = self.pet.frameGeometry().topLeft() - QPoint(0, self.height() + SPEECH_TIMER_GAP)
+        speech = getattr(self.pet, 'speech', None)
+        if speech is not None and speech.isVisible():
+            point = QPoint(point.x(), min(point.y(), speech.y() - self.height() - SPEECH_TIMER_GAP))
+        self.move(point)
 
     def set_paused(self, paused: bool) -> None:
         """按钮文字跟着状态走：暂停中显示「继续」。"""
@@ -551,7 +781,7 @@ class PetCanvas(QWidget):
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None], notify: Callable[[str, str], None] | None = None) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.notify = notify; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self._pomodoro_total = 0; self.following = False; self._think_until = 0.0; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.notify = notify; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self._pomodoro_total = 0; self.following = False; self._think_until = 0.0; self._menu_open = False; self._reply_form = FORM_WINDOW; self._speech_buffer = ''; self._speech_shown = ''; self._drag_origin = QPoint(0, 0); self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
@@ -559,7 +789,12 @@ class PetWindow(QWidget):
         self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy); self.conversation.reasoning_changed.connect(self._on_reasoning_changed)
         self.conversation.consolidated.connect(self._on_consolidated)
         self.conversation.mood_changed.connect(self._on_mood_changed)
-        self.chat = ChatDialog(None, self.conversation); self.timer_window = TimerWindow(self, self.toggle_pomodoro, self.reset_pomodoro, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._follow_timer = QTimer(self); self._follow_timer.setInterval(FOLLOW_TICK_MS); self._follow_timer.timeout.connect(self._follow_step); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place(); self._resume_motion()
+        # 对白气泡形式下，回复也往角色上方那个小窗口里流一份（聊天窗口照旧记录，两者同一段会话）
+        self.conversation.delta.connect(self._on_reply_delta)
+        self.conversation.finished.connect(self._on_reply_finished)
+        self.conversation.failed.connect(self._on_reply_failed)
+        self.conversation.silenced.connect(self._on_reply_silenced)
+        self.chat = ChatDialog(None, self.conversation); self.speech = SpeechBubble(self); self.input_box = FloatingInput(self); self.input_box.submitted.connect(self._send_from_input); self.conversation.busy_changed.connect(self.input_box.set_busy); self._speech_timer = QTimer(self); self._speech_timer.setInterval(SPEECH_FLUSH_MS); self._speech_timer.timeout.connect(self._flush_speech); self.timer_window = TimerWindow(self, self.toggle_pomodoro, self.reset_pomodoro, self.stop_pomodoro); self.tick = QTimer(self); self.tick.timeout.connect(self._tick); self.wander = QTimer(self); self.wander.setInterval(5500); self.wander.timeout.connect(self._wander); self.wander.start(); self._follow_timer = QTimer(self); self._follow_timer.setInterval(FOLLOW_TICK_MS); self._follow_timer.timeout.connect(self._follow_step); self._mood_timer = QTimer(self); self._mood_timer.setSingleShot(True); self._mood_timer.timeout.connect(self._expire_mood); self.load_character(load_settings()); self._place(); self._resume_motion(); self._topmost_timer = QTimer(self); self._topmost_timer.setInterval(TOPMOST_CHECK_MS); self._topmost_timer.timeout.connect(self._keep_on_top); self._topmost_timer.start()
     def _place(self) -> None:
         area = self.screen().availableGeometry(); self.move(area.right()-self.width()-24, area.bottom()-self.height()-20)
     def _sync_geometry(self) -> None:
@@ -569,6 +804,7 @@ class PetWindow(QWidget):
             width, height = DEFAULT_CANVAS_SIZE.width(), DEFAULT_CANVAS_SIZE.height()
         self.setFixedSize(width, height + BUBBLE_HEIGHT); self.canvas.setGeometry(0, BUBBLE_HEIGHT, width, height); self.bubble.setGeometry(8, 0, width - 16, BUBBLE_HEIGHT)
         if self.isVisible(): self._clamp_to_screen()
+        if hasattr(self, 'speech'): self._place_floating()
     def _clamp_to_screen(self) -> None:
         area = self.screen().availableGeometry(); self.move(max(area.left(), min(self.x(), area.right() - self.width())), max(area.top(), min(self.y(), area.bottom() - self.height())))
     def load_character(self, data: dict) -> None:
@@ -595,6 +831,9 @@ class PetWindow(QWidget):
         self.conversation.configure(name, info, data.get("conversation", {}).get("base_prompt", ""))
         self.chat.set_title(name)
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
+        # 对话形式与对白透明度跟随设置（启动、换角色、保存设置都会走到这里）
+        self._reply_form = str(data.get('conversation', {}).get('reply_form', FORM_WINDOW))
+        self.speech.set_opacity(int(data.get('conversation', {}).get('bubble_opacity', SPEECH_OPACITY_DEFAULT)))
     def _on_conversation_busy(self, busy: bool) -> None:
         # 刚发出消息、还一个分片都没到的时候，先按"思考"处理
         if busy: self._reasoning = True; self.canvas.set_state('Think'); self.animation.stop()
@@ -614,14 +853,14 @@ class PetWindow(QWidget):
         self.conversation.start_new_session(); self.chat.load_history([])
     def reset_memory(self) -> None:
         """记忆被清空后：另起一段新会话，并把对话窗里的历史一并抹掉。"""
-        self.conversation.reset_memory(); self.chat.load_history([]); self.say('记忆已清空')
+        self.conversation.reset_memory(); self.chat.load_history([]); self.speech.dismiss(); self.say('记忆已清空')
     def _on_consolidated(self, added: int, merged: int) -> None:
         if added > 0: self.say(f'记忆已整理，新增 {added} 条')
     def show_pet(self) -> None:
         """入口调用：有立绘就显示窗口，没有则隐藏并提示一次。"""
         if self.assets is not None:
             self._art_warned = None; self.show(); return
-        self.hide()
+        self.hide(); self.speech.dismiss(); self.input_box.hide()
         name, info = current_character(load_settings())
         folder = characters.sprite_dir(name, info) if name else None
         fingerprint = f"{name}|{folder}"
@@ -688,6 +927,16 @@ class PetWindow(QWidget):
         这时候一律站着不动——一动起来，思考动作就被 Move 素材盖住了，看着像边发呆边挪。
         """
         return self._reasoning or time.monotonic() < self._think_until
+    def _keep_on_top(self) -> None:
+        """定时复核"桌宠在最上面"。
+
+        别的程序（尤其是全屏程序来回切）会把置顶属性顶掉，之后桌宠就沉到别人窗口后面
+        去了。这里重新声明一次，并带上番茄钟浮窗——两层都声明，相对关系（浮窗在角色
+        之上）才始终一致。菜单弹出期间跳过：否则桌宠会被提到菜单上面，菜单就点不着了。
+        """
+        if not self.isVisible() or self.drag or self._menu_open: return
+        _reassert_topmost(self)
+        if self.timer_window.isVisible(): _reassert_topmost(self.timer_window)
     def _on_wander_finished(self) -> None:
         # 拖拽中不要覆盖 Drag 姿态（松手时 mouseReleaseEvent 会自己恢复）
         if not self.drag: self._restore_state()
@@ -709,36 +958,58 @@ class PetWindow(QWidget):
         self._build_expression_menu(m)
         self._build_motion_menu(m)
         m.addSeparator()
-        a=m.addAction('关闭对话框' if self.chat.isVisible() else '打开对话框'); a.triggered.connect(self.close_chat if self.chat.isVisible() else lambda: self.chat.show_near(self)); a=m.addAction('停止番茄钟' if self.pomodoro_active else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.pomodoro_active else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
+        self._add_conversation_action(m); a=m.addAction('停止番茄钟' if self.pomodoro_active else f"开始 {d['tools']['pomodoro_minutes']} 分钟番茄钟"); a.triggered.connect(self.stop_pomodoro if self.pomodoro_active else self.start_pomodoro); m.addSeparator(); a=m.addAction('设置'); a.triggered.connect(self.open_settings)
         return m
     def contextMenuEvent(self, e: QContextMenuEvent) -> None:
-        self._build_context_menu().exec(e.globalPos())
+        # 菜单弹出期间挂个标记：看门狗这会儿不要重声明置顶，否则桌宠被提到菜单之上，
+        # 菜单就被自己的角色挡住了，点不着
+        self._menu_open = True
+        try: self._build_context_menu().exec(e.globalPos())
+        finally: self._menu_open = False
     def mousePressEvent(self,e:QMouseEvent)->None:
         if e.button()==Qt.LeftButton:
             # 抓住角色时先停掉随机游走：否则动画会继续驱动窗口位置，和拖拽互相拉扯
             self.animation.stop(); self._drag_direction.reset()
+            self._drag_origin=self.pos()
             self.drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft(); self.canvas.set_state('Drag')
     def mouseMoveEvent(self,e:QMouseEvent)->None:
         if self.drag and e.buttons()&Qt.LeftButton:
             position=e.globalPosition().toPoint()-self.drag
             self.canvas.set_state('Drag', mirrored=self._drag_direction.update(position.x()-self.x())); self.move(position); self.timer_window.place()
     def mouseReleaseEvent(self,e:QMouseEvent)->None:
-        if e.button()==Qt.LeftButton: self.drag=None; self._restore_state()
+        if e.button()==Qt.LeftButton:
+            self.drag=None; self._restore_state()
+            moved=self.pos()-self._drag_origin
+            # 只把"真搬动了"算事件（见 DRAG_EVENT_MIN_PIXELS）：它会真的打一次接口。
+            # 不报位置：那会在上下文里堆一串过时的方位，模型也用不上
+            if math.hypot(moved.x(),moved.y())>=DRAG_EVENT_MIN_PIXELS:
+                self.conversation.notify_event('拖动', '用户拖动了你')
     def moveEvent(self,e)->None:  # type: ignore[no-untyped-def]
         if hasattr(self,'timer_window') and self.timer_window.isVisible(): self.timer_window.place()
+        if hasattr(self,'speech'): self._place_floating()
     def set_motion_mode(self, mode: str, notice: bool = True)->None:
         """切换动作模式：``stationary`` 固定 / ``movable`` 自由走动 / ``follow`` 跟随鼠标。
 
         ``notice=False`` 用于启动时静默落回默认模式，不弹气泡。
         """
         if mode not in ('stationary','movable','follow'): mode='stationary'
+        was=str(load_settings()['motion']['mode'])
         d=load_settings(); d['motion']['mode']=mode; save_settings(d)
         self.following = mode=='follow'
         if self.following:
             self._follow_timer.start(FOLLOW_TICK_MS); self._follow_step()
         else:
             self._follow_timer.stop(); self.animation.stop(); self._restore_state()
-        if notice: self.say({'stationary':'固定在这里','movable':'自由走动','follow':'跟着你走'}[mode])
+        # 不弹"固定在这里 / 自由走动 / 跟着你走"这类提示：它和角色上方的对白挤在同一片
+        # 地方，一旦模型顺着事件回上一句，两条文字就叠在一起了。切换本身看得见（菜单勾选、
+        # 角色开始 / 停止走动），三种模式都作为 [动作] 事件交给模型，由它决定要不要开口。
+        # 启动时静默落回默认模式不发事件，见 notice。
+        if not notice or mode == was: return
+        self.conversation.notify_event('动作', {
+            'movable':'用户让你开始自由走动',
+            'stationary':'用户把你固定在了原地',
+            'follow':'用户让你开始跟着鼠标走',
+        }[mode])
     def exit_follow(self)->None:
         """退出跟随（右键里取消）：原地停下，回到固定模式。"""
         if self.following: self.set_motion_mode('stationary')
@@ -760,6 +1031,8 @@ class PetWindow(QWidget):
     def _follow_step(self)->None:
         """朝鼠标走一步：速度沿用 MOVE_SPEED，走到离线一段距离就停住。"""
         if not self.following or self.drag or self.pinned_expression is not None: return
+        # 番茄钟开着不动：专注期间不该跟着光标满桌跑（跟随机游走一个道理）
+        if self.pomodoro_active: return
         # 思考动作期间不动（跟随机游走一个道理）
         if self._thinking(): return
         if self.animation.state()==QPropertyAnimation.State.Running: return
@@ -785,9 +1058,71 @@ class PetWindow(QWidget):
         self.animation.setStartValue(self.pos()); self.animation.setEndValue(target)
         self.animation.setDuration(max(80, round(moved/MOVE_SPEED*1000))); self.animation.start()
     def apply_settings(self, data:dict)->None:
-        # 对话窗的开关已取消：只由右键菜单打开，保存设置不再改动它的可见性
+        # 对话窗/输入框的开关已取消：只由右键菜单打开；保存设置只做一件事——
+        # 换了对话形式就把另一种收起来，免得两个入口同时挂着
         self.load_character(data); self.show_pet()
+        if self._reply_form == FORM_BUBBLE: self.chat.hide()
+        else: self.input_box.hide()
         if self.isVisible(): self.say('设置已保存')
+    # ---- 对话形式：聊天窗口 / 漂浮输入框 + 对白气泡 -------------------------
+
+    def _speech_hold_ms(self) -> int:
+        """对白停留时长（秒 → 毫秒）：设置里 3~30 秒，越界就夹回来。"""
+        try: seconds = int(load_settings()['conversation'].get('bubble_seconds', 8))
+        except (TypeError, ValueError): seconds = 8
+        return max(3, min(30, seconds)) * 1000
+    def _on_reply_delta(self, text: str) -> None:
+        if self._reply_form != FORM_BUBBLE: return
+        self._speech_buffer += text
+        if not self._speech_timer.isActive(): self._speech_timer.start()
+    def _flush_speech(self) -> None:
+        text = self._speech_buffer.strip()
+        if not text or text == self._speech_shown: return
+        self._speech_shown = text
+        self.speech.show_text(text)          # 流式期间只长个儿，不启动消失计时
+    def _on_reply_finished(self, text: str) -> None:
+        self._speech_timer.stop()
+        if self._reply_form != FORM_BUBBLE: return
+        body = (text or self._speech_buffer).strip() or '...'
+        self._speech_buffer = ''; self._speech_shown = body
+        self.speech.show_text(body, hold_ms=self._speech_hold_ms())
+    def _on_reply_silenced(self) -> None:
+        """模型对事件选择"不作回应"：界面什么都不显示（历史与日志里照旧留着这一轮）。"""
+        self._speech_timer.stop(); self._speech_buffer = ''; self._speech_shown = ''
+    def _on_reply_failed(self, message: str) -> None:
+        self._speech_timer.stop(); self._speech_buffer = ''; self._speech_shown = ''
+        if self._reply_form != FORM_BUBBLE: return
+        self.speech.show_text(f'出错：{message}', hold_ms=self._speech_hold_ms())
+    def _send_from_input(self, text: str) -> None:
+        """漂浮输入框发出去的消息。
+
+        同一段会话：照样往聊天窗口里补一条用户气泡——它同样挂着这段会话，如此之后
+        再打开聊天窗口时历史是连着的，不会变成两条互不相干的对话。
+        """
+        self.chat.add(text, True)
+        self.conversation.send(text)
+    def open_input(self) -> None:
+        """托盘入口：打开当前这个对话形式。"""
+        if self._reply_form == FORM_BUBBLE: self.input_box.open()
+        else: self.chat.show_near(self)
+    def toggle_input(self) -> None:
+        """右键入口：漂浮输入框开 / 收。"""
+        if self._reply_form != FORM_BUBBLE:
+            self.chat.hide() if self.chat.isVisible() else self.chat.show_near(self); return
+        self.input_box.hide() if self.input_box.isVisible() else self.input_box.open()
+    def _add_conversation_action(self, menu: QMenu) -> None:
+        """右键菜单里的"打开对话"入口，按当前形式决定开哪一个。"""
+        if self._reply_form == FORM_BUBBLE:
+            opened = self.input_box.isVisible()
+            action = menu.addAction('收起输入框' if opened else '打开输入框'); action.triggered.connect(self.toggle_input)
+            return
+        opened = self.chat.isVisible()
+        action = menu.addAction('关闭对话框' if opened else '打开对话框')
+        action.triggered.connect(self.close_chat if opened else lambda: self.chat.show_near(self))
+    def _place_floating(self) -> None:
+        """跟随角色移动：对白在角色上方、输入框在角色下方。"""
+        if hasattr(self, 'speech') and self.speech.isVisible(): self.speech.place()
+        if hasattr(self, 'input_box') and self.input_box.isVisible(): self.input_box.place()
     def close_chat(self)->None: self.chat.hide()
     @property
     def pomodoro_active(self) -> bool:
@@ -796,26 +1131,33 @@ class PetWindow(QWidget):
     def start_pomodoro(self)->None:
         self._pomodoro_total=load_settings()['tools']['pomodoro_minutes']*60; self.remaining=self._pomodoro_total
         self.timer_window.set_paused(False); self.tick.start(1000); self._timer_text(); self.timer_window.place(); self.timer_window.show(); self.canvas.set_state('Focus'); self.say('开始专注')
+        self.conversation.notify_event('番茄钟', f'用户开始了一段 {self._pomodoro_total//60} 分钟的专注计时')
     def toggle_pomodoro(self)->None:
         """暂停 / 继续。浮窗不隐藏——它同时是"继续"的入口。"""
         if self.tick.isActive():
             self.tick.stop(); self.timer_window.set_paused(True); self._restore_state(); self.say('番茄钟已暂停')
+            self.conversation.notify_event('番茄钟', '用户暂停了专注计时')
         else:
             self.tick.start(1000); self.timer_window.set_paused(False); self.canvas.set_state('Focus'); self.say('继续专注')
+            self.conversation.notify_event('番茄钟', '用户继续了专注计时')
     def reset_pomodoro(self)->None:
         """回到设定时长并停下（浮窗留着，随时可以再点继续）。"""
         self.tick.stop(); self._pomodoro_total=load_settings()['tools']['pomodoro_minutes']*60; self.remaining=self._pomodoro_total
         self._timer_text(); self.timer_window.set_paused(False); self._restore_state(); self.say('番茄钟已重置')
     def stop_pomodoro(self)->None:
         self.tick.stop(); self.timer_window.hide(); self.timer_window.set_paused(False); self._restore_state(); self.say('番茄钟已停止')
+        self.conversation.notify_event('番茄钟', '用户停止了专注计时')
     def _timer_text(self)->None: self.timer_window.label.setText(f'{self.remaining//60:02d}:{self.remaining%60:02d}')
     def _tick(self)->None:
         self.remaining-=1; self._timer_text()
         if self.remaining<=0:
             self.tick.stop(); self.timer_window.hide(); self.timer_window.set_paused(False); self._restore_state(); self.say('专注完成！',5000)
             if self.notify is not None: self.notify('番茄钟结束', f'{max(1,self._pomodoro_total//60)} 分钟专注完成，起来动一动吧～')
+            self.conversation.notify_event('番茄钟', f'用户 {max(1,self._pomodoro_total//60)} 分钟的专注计时完成了')
     def _wander(self)->None:
         if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
+        # 番茄钟开着就老实待着：这段是"专注"时间，不该满桌乱走
+        if self.pomodoro_active: return
         # 思考动作期间不随机移动：一走路，思考动作就被 Move 素材盖住了
         if self._thinking(): return
         _, chance, distance = motion_profile(self.activity)

@@ -23,6 +23,8 @@ def main() -> None:
     pet = PetWindow(settings.show_from_tray, settings.apply_external_settings, settings.notify)
     settings.settings_saved.connect(pet.apply_settings)
     settings.memory_reset.connect(pet.reset_memory)
+    # 托盘里的「打开对话」：按当前对话形式开聊天窗口或漂浮输入框
+    settings.input_requested.connect(pet.open_input)
     # 重启即全新会话：历史由长期记忆承载；同时后台补做上次没整理完的会话
     pet.begin_new_session()
     pet.conversation.start_consolidation()

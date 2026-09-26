@@ -24,6 +24,7 @@ from typing import Any, Sequence
 from app import characters, devtools
 from app.conversation import clock, prompts
 from app.conversation.message import (
+    EVENT_HINT,
     INTERRUPT_HINT,
     NARRATION_HINT,
     Message,
@@ -289,6 +290,18 @@ class MemoryStore:
         message = Message(role=ROLE_USER, content=text)
         history = [item for item in self.load() if item.role in (ROLE_USER, ROLE_ASSISTANT)]
         message.narration = self._time_narration(history + [message])
+        self.append(message)
+        return message
+
+    def append_event(self, text: str) -> Message:
+        """落盘一条「事件」消息：用户在角色身上的操作（拖动 / 番茄钟 / 跟随）。
+
+        用 user 角色进上下文，模型才能顺着它回应；但它**不是**用户说的话，所以：
+
+        * 界面上不显示（见 :attr:`Message.event`）；
+        * 也不挂时间旁白——事件本身就是"刚刚发生"，再叠一行时间只是噪音。
+        """
+        message = Message(role=ROLE_USER, content=text, event=True)
         self.append(message)
         return message
 
@@ -748,6 +761,9 @@ class MemoryStore:
         if any(message.narration for message in recent):
             # 时间行是消息自带的属性：窗口里还有，模型就还会看到这个标记
             marks.append(NARRATION_HINT)
+        if any(message.event for message in recent):
+            # 只有窗口里真的带着事件行时才解释这套标记，平时不花这份 token
+            marks.append(EVENT_HINT)
         if marks:
             sections.append(f"{prompts.MARKS}\n" + "\n".join(marks))
         if any(message.interrupted for message in recent):

@@ -36,6 +36,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "auto_expression": True,
         #: 表情切换灵敏度 1~10（越大越跟手，见 app/pet/emotion.py 的参数表）
         "expression_sensitivity": 5,
+        #: 对话形式：``window`` 聊天窗口 / ``bubble`` 漂浮输入框 + 角色上方的对白气泡
+        "reply_form": "window",
+        #: 对白气泡停留秒数（3~30），只在对白形式下有意义
+        "bubble_seconds": 8,
+        #: 对白气泡背景的不透明度（30~100，百分比），只在对白形式下有意义
+        "bubble_opacity": 80,
     },
     "motion": {"mode": "stationary"},
     "tools": {"pomodoro_minutes": 25, "weather_city": "", "quick_note_hint": True},

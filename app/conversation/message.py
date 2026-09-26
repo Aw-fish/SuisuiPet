@@ -29,6 +29,33 @@ NARRATION_HINT = (
     f"- 以 {NARRATION_TAG} 开头的是当前对话发生的现实时间，不是用户说的话。无需刻意提起，在与时间有关的话题中作为参考（如上午好/今天是周末等）"
 )
 
+#: 模型"不想对事件开口"时的固定回复：本地捕获后不显示、也不触发对白框，
+#: 但这一轮照样记进会话日志与开发者面板——它确实发生过。
+SILENT_MARK = "（不做回应）"
+#: 去掉标记自带的括号，用于容忍全角 / 半角混用
+_SILENT_BODY = SILENT_MARK.strip("（）()")
+
+#: 事件消息（用户操作）的标记说明。只在上下文里真的带事件时才注入：
+#: 要说清"这不是用户当面对你说的话"，以及不想回应时可以怎么表示。
+EVENT_HINT = (
+    "- 以 [ ] 开头的是角色的动作或环境事件（如 [拖动]、[番茄钟]、[动作]），不是用户当面对你说的话。"
+    f"可以顺着它回应一句，也可以不作回应——对事件不想开口时只输出 {SILENT_MARK}，界面上不会显示任何东西；"
+    "而用户直接对你说话时，请正常回应"
+)
+
+
+def is_silent(text: str) -> bool:
+    """这段回复是不是"明确表示不作回应"。容忍全角 / 半角括号与首尾空白。"""
+    return text.strip().strip("（）()").strip() == _SILENT_BODY
+
+
+def silent_pending(text: str) -> bool:
+    """这段（可能还没收完的）文本仍有可能变成"不作回应"吗？
+
+    流式转发前用它判断：是的话就先按住不发，免得界面上闪出几个字又消失。
+    """
+    return _SILENT_BODY.startswith(text.strip().strip("（）()").strip()) or is_silent(text)
+
 
 def now_stamp() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -44,6 +71,10 @@ class Message:
     #: 所以之后每一轮把历史发出去时它都还带着——模型不会因为"时间行挪到新消息上"而从
     #: 第二轮起就失去时间观念。什么时候挂由 :meth:`MemoryStore.append_user` 决定。
     narration: str = ""
+    #: 这条消息是不是「用户操作事件」（[拖动] / [番茄钟] / [跟随] 这类，见 :data:`EVENT_HINT`）。
+    #: 事件用 user 角色进请求（模型可以顺着它回应），但界面上不显示——只留给请求、会话
+    #: 日志与开发者面板。
+    event: bool = False
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str = ""
 
@@ -74,6 +105,8 @@ class Message:
             record["narration"] = self.narration
         if self.interrupted:
             record["interrupted"] = True
+        if self.event:
+            record["event"] = True
         if self.tool_calls:
             record["tool_calls"] = self.tool_calls
         if self.tool_call_id:
@@ -88,6 +121,7 @@ class Message:
             ts=str(record.get("ts", "")) or now_stamp(),
             interrupted=bool(record.get("interrupted")),
             narration=str(record.get("narration", "")),
+            event=bool(record.get("event")),
             tool_calls=list(record.get("tool_calls") or []),
             tool_call_id=str(record.get("tool_call_id", "")),
         )
