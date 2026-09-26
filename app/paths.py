@@ -5,9 +5,15 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+if getattr(sys, "frozen", False):
+    # 打包后（PyInstaller）：源码被塞进包内部，按它的位置找 data/ 会落进 _internal。
+    # 这里改成认 exe 所在的目录，data/ 就摆在程序旁边，用户能自己换立绘、改配置。
+    ROOT_DIR = Path(sys.executable).resolve().parent
+else:
+    ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 #: 角色总目录，每个角色一个子文件夹

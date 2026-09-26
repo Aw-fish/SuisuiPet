@@ -305,6 +305,39 @@ class MemoryStore:
         self.append(message)
         return message
 
+    def discard(self, message: Message) -> bool:
+        """把刚追加的这条消息撤回来（请求失败、模型根本没看到它时用）。
+
+        会话日志是"一行一条"的追加文件，撤回就是删掉最后一行；如果这段会话因此空了，
+        顺手把「待整理」登记也撤掉——否则下次整理会翻出一段没人回应的对话，把用户
+        根本没送出去的话记成长期记忆。
+
+        只在最后一行确实是它时才动手：中间要是又写进了别的东西（理论上不会），
+        就宁可不动，也不能删错。
+        """
+        path = self.session_path
+        if not path.is_file():
+            return False
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            return False
+        try:
+            last = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(last, dict):
+            return False
+        if str(last.get("role", "")) != message.role or str(last.get("content", "")) != message.content:
+            return False
+        rest = lines[:-1]
+        if rest:
+            path.write_text("\n".join(rest) + "\n", encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+            self.clear_pending(path.name)
+            self._pending_marked.discard(path.name)
+        return True
+
     def read_session(self, path: Path) -> list[Message]:
         messages: list[Message] = []
         if not path.is_file():

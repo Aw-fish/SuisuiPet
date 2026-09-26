@@ -11,7 +11,7 @@ from typing import Any, Iterator, Sequence
 
 import requests
 
-from app.conversation.providers.base import Chunk, ProviderError, ToolCall
+from app.conversation.providers.base import CONFIG_STATUS_CODES, Chunk, ProviderError, ToolCall
 
 CONNECT_TIMEOUT = 10
 PROBE_TIMEOUT = 20
@@ -69,9 +69,16 @@ class OpenAICompatProvider:
 
     def _validate(self) -> None:
         if not self.base_url:
-            raise ProviderError("没有配置 API 地址")
+            raise ProviderError("没有配置 API 地址", True)
         if not self.model:
-            raise ProviderError("没有配置模型名称")
+            raise ProviderError("没有配置模型名称", True)
+
+    def _raise_http(self, response: requests.Response) -> None:
+        """按状态码抛错；401/403/404 标成"配置没弄好"，交上层换成人话提示。"""
+        raise ProviderError(
+            self._error_text(response),
+            config=response.status_code in CONFIG_STATUS_CODES,
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -113,7 +120,7 @@ class OpenAICompatProvider:
             self._response = response
         try:
             if response.status_code >= 400:
-                raise ProviderError(self._error_text(response))
+                self._raise_http(response)
             yield from self._iter_chunks(response, cancel)
         finally:
             with self._lock:
@@ -151,7 +158,7 @@ class OpenAICompatProvider:
             raise ProviderError(self._network_error(exc)) from exc
         try:
             if response.status_code >= 400:
-                raise ProviderError(self._error_text(response))
+                self._raise_http(response)
             body = response.json()
         finally:
             response.close()
@@ -179,7 +186,7 @@ class OpenAICompatProvider:
         except requests.RequestException as exc:
             raise ProviderError(self._network_error(exc)) from exc
         if response.status_code >= 400:
-            raise ProviderError(self._error_text(response))
+            self._raise_http(response)
         return self.model
 
     @staticmethod

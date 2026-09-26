@@ -29,7 +29,7 @@ BASE_SYSTEM_PROMPT = (
 )
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "character": {"selected": "Suisui", "registered": ["Suisui"]},
+    "character": {"selected": characters.DEFAULT_CHARACTER_NAME, "registered": [characters.DEFAULT_CHARACTER_NAME]},
     "conversation": {
         "base_prompt": BASE_SYSTEM_PROMPT,
         #: 让模型在回复里内嵌 [开心] 这类标记，立绘随之换表情
@@ -46,7 +46,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "motion": {"mode": "stationary"},
     "tools": {
         "pomodoro_minutes": 25,
-        "weather_city": "",
         "quick_note_hint": True,
         #: 记事板背景不透明度（30~100，百分比）
         "notes_opacity": 90,
@@ -127,7 +126,7 @@ def _normalize(settings: dict[str, Any]) -> None:
         if name and name not in registered and characters.character_dir(name).is_dir():
             registered.append(name)
     if not registered:
-        registered = [str(character.get("selected") or "").strip() or "Suisui"]
+        registered = [str(character.get("selected") or "").strip() or characters.DEFAULT_CHARACTER_NAME]
     character["registered"] = registered
     if character.get("selected") not in registered:
         character["selected"] = registered[0]

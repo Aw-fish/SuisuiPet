@@ -20,3 +20,7 @@ data/characters/*/character.json
 # 记忆系统的设计笔记与开发日志，保留在本地，不随仓库同步
 memory.md
 devlog.md
+
+# 打包产物：demo/ 是 PyInstaller 的 onedir 输出（百兆级），build/ 是中间产物
+demo/
+build/

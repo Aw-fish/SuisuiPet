@@ -25,6 +25,11 @@ from app.paths import CHARACTERS_DIR
 
 CONFIG_NAME = "character.json"
 SPRITE_DIRNAME = "sprites"
+#: 内置的默认角色名。刻意与仓库自带的 ``data/characters/default/`` 对齐：
+#: 全新安装（或打包成 demo）时还没有 settings.json，选中的就是这个名字，对不上就会
+#: 明明带着立绘却报"找不到立绘"。
+#: （注意别与下面的 ``DEFAULT_CHARACTER`` 配置模板重名——那是另一回事。）
+DEFAULT_CHARACTER_NAME = "default"
 MEMORY_DIRNAME = "memory"
 
 #: API Key 存在这里，方便本地改动；character.json 已在 .gitignore 中忽略，
@@ -127,7 +132,7 @@ def save_character(name: str, info: dict[str, Any]) -> None:
 def ensure_character(name: str) -> str:
     """保证角色文件夹与配置存在（幂等），返回实际使用的名字。"""
     if not is_valid_name(name):
-        name = "Suisui"
+        name = DEFAULT_CHARACTER_NAME
     directory = character_dir(name)
     if not directory.is_dir():
         directory.mkdir(parents=True, exist_ok=True)

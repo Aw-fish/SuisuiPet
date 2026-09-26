@@ -121,10 +121,15 @@ class SettingsWindow(QMainWindow):
         self._memory_window: MemoryWindow | None = None
         self._dev_window: DevWindow | None = None
         self._test_worker: _ConnectWorker | None = None
+        #: 装载角色配置期间为真：这时别把"选中了 live2d"当成用户点击去切回立绘
+        self._loading_formats = False
         # 拦截器必须被持有，否则会被 Python 回收导致失效
         self._wheel_guards: list[WheelGuard] = []
         self.setWindowTitle("SuisuiPet")
-        self.setFixedSize(900, 740)
+        # 正文区实际可用宽度 = 窗口宽 - 侧栏 - 两侧留白：900 时只剩约 600，
+        # 角色页那一排"添加/导入/删除角色"按钮会被挤到看不见，这里把窗口放宽、
+        # 侧栏收窄，正文一次多出约 150px
+        self.setFixedSize(1010, 740)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._build()
@@ -142,7 +147,7 @@ class SettingsWindow(QMainWindow):
         shell.setContentsMargins(0, 0, 0, 0)
         shell.setSpacing(0)
         sidebar = QFrame(objectName="sidebar")
-        sidebar.setFixedWidth(206)
+        sidebar.setFixedWidth(178)
         nav = QVBoxLayout(sidebar)
         nav.setContentsMargins(14, 22, 14, 18)
         nav.addWidget(QLabel("SuisuiPet", objectName="brand"))
@@ -252,8 +257,13 @@ class SettingsWindow(QMainWindow):
         self.format_group.addButton(self.img_format)
         self.format_group.addButton(self.live2d_format)
         self.img_format.toggled.connect(self._on_format_changed)
+        self.live2d_format.toggled.connect(self._on_live2d_toggled)
+        # live2d 还没做完：选中就提示一句并切回立绘。提示平时藏着，点到了才出来
+        self.live2d_hint = QLabel("该功能施工中> <", objectName="hint")
+        self.live2d_hint.hide()
         formats.addWidget(self.img_format)
         formats.addWidget(self.live2d_format)
+        formats.addWidget(self.live2d_hint)
         formats.addStretch()
         layout.addLayout(formats)
         layout.addWidget(self._label("模型文件"))
@@ -291,15 +301,15 @@ class SettingsWindow(QMainWindow):
         self.base_url = QLineEdit()
         self.base_url.setPlaceholderText("例如：https://api.deepseek.com")
         layout.addWidget(self.base_url)
-        layout.addWidget(self._label("代理（可留空）"))
-        self.proxy = QLineEdit()
-        self.proxy.setPlaceholderText("留空 = 直连并忽略系统代理，例如 http://127.0.0.1:7890")
-        layout.addWidget(self.proxy)
         layout.addWidget(self._label("API Key"))
         self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.Password)
         self.key.setPlaceholderText("仅保存在本机，character.json 不会被上传")
         layout.addWidget(self.key)
+        layout.addWidget(self._label("代理（可留空）"))
+        self.proxy = QLineEdit()
+        self.proxy.setPlaceholderText("留空 = 直连并忽略系统代理")
+        layout.addWidget(self.proxy)
         params = QHBoxLayout()
         params.setSpacing(12)
         temperature_box = QVBoxLayout()
@@ -342,7 +352,7 @@ class SettingsWindow(QMainWindow):
         dwell_ms, timeout_ms = mood_timing(value)
         self.sensitivity_hint.setText(
             f"参数越高，表情切换越快：最短停留 {dwell_ms / 1000:g} 秒，"
-            f"{timeout_ms // 60000} 分钟没有新情绪就回到默认立绘。"
+            f"{timeout_ms / 1000:g} 秒没有新情绪就回到默认立绘。"
         )
 
     def _on_auto_expression_toggled(self, checked: bool) -> None:
@@ -462,10 +472,6 @@ class SettingsWindow(QMainWindow):
         self.pomodoro = QSpinBox(); self.pomodoro.setRange(5, 120); self.pomodoro.setSuffix(" 分钟")
         layout.addWidget(self.pomodoro)
         layout.addSpacing(18)
-        layout.addWidget(self._label("天气城市"))
-        self.city = QLineEdit(); self.city.setPlaceholderText("例如：上海")
-        layout.addWidget(self.city)
-        layout.addSpacing(18)
         layout.addWidget(self._label("记事板不透明度"))
         notes_row = QHBoxLayout()
         notes_row.setSpacing(10)
@@ -567,8 +573,15 @@ class SettingsWindow(QMainWindow):
     def _load_character_fields(self, name: str) -> None:
         info = self._character_info(name)
         is_img = info.get("format", "img") != "live2d"
-        self.img_format.setChecked(is_img)
-        self.live2d_format.setChecked(not is_img)
+        self._loading_formats = True
+        try:
+            self.img_format.setChecked(is_img)
+            self.live2d_format.setChecked(not is_img)
+        finally:
+            self._loading_formats = False
+        # 提示按配置本身定：存量的 live2d 角色要说明"为什么它还没生效"，
+        # img 角色则收起来。显式设一次——两个单选都没换状态时不会有信号过来。
+        self.live2d_hint.setVisible(not is_img)
         self._show_asset_target(name, info)
         self.model.setText(str(info.get("model", "")))
         self.base_url.setText(str(info.get("base_url", "")))
@@ -670,6 +683,20 @@ class SettingsWindow(QMainWindow):
         self._flush_characters()
         save_settings(self.data)
         self._refresh_character_combo(name)
+
+    def _on_live2d_toggled(self, checked: bool) -> None:
+        """live2d 还在施工：点到就切回立绘，并在旁边说明一句。
+
+        ``_loading_formats`` 期间不动手——存量角色本来就是 live2d 的话，装载配置时
+        不该被悄悄改成 img；只把提示亮起来，告诉用户为什么它还没生效。
+        """
+        if not checked:
+            self.live2d_hint.hide()
+            return
+        if not self._loading_formats:
+            # 切回立绘会让 live2d 取消勾选（又触发一次 checked=False），所以提示放到最后亮
+            self.img_format.setChecked(True)
+        self.live2d_hint.show()
 
     def _on_format_changed(self) -> None:
         if not hasattr(self, "asset_path") or not self._active_character:
@@ -814,7 +841,7 @@ class SettingsWindow(QMainWindow):
         self._on_bubble_opacity_changed(self.bubble_opacity.value())
         self._on_form_toggled(self.form_bubble.isChecked())
         self.base_prompt.setPlainText(str(a.get("base_prompt") or BASE_SYSTEM_PROMPT))
-        self.pomodoro.setValue(t["pomodoro_minutes"]); self.city.setText(t["weather_city"])
+        self.pomodoro.setValue(t["pomodoro_minutes"])
         try:
             notes_opacity = int(t.get("notes_opacity", 90))
         except (TypeError, ValueError):
@@ -852,7 +879,6 @@ class SettingsWindow(QMainWindow):
         self.data["motion"]["mode"] = "movable" if self.movable.isChecked() else "stationary"
         self.data["tools"].update({
             "pomodoro_minutes": self.pomodoro.value(),
-            "weather_city": self.city.text().strip(),
             "notes_opacity": self.notes_opacity.value(),
             "notes_position": (
                 "corner" if self.notes_corner.isChecked()

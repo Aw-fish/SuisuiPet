@@ -34,19 +34,20 @@ EXPRESSION_HINT = (
 )
 
 # ---- 防抖参数：想调节奏只改这张表 -------------------------------------------
-#: 灵敏度(1~10) -> (最短停留秒, 无新情绪后回归默认的分钟数)
-#: 5 是推荐值：切换不频繁也不迟钝。
+#: 灵敏度(1~10) -> (最短停留秒, 无新情绪后回归默认的秒数)。
+#: 一个表情的寿命落在 **5 秒 ~ 1 分钟**：短了刚换上就跳回去，看着像闪；长了会一直挂着——
+#: 表情是"这一句的语气"，不该比这段话本身活得久。5 是推荐值。
 MOOD_TIMING: dict[int, tuple[float, float]] = {
-    1: (4.0, 8.0),
-    2: (3.5, 7.0),
-    3: (3.0, 6.0),
-    4: (2.2, 4.5),
-    5: (1.5, 3.0),
-    6: (1.3, 2.5),
-    7: (1.1, 2.0),
-    8: (1.0, 1.5),
-    9: (0.9, 1.2),
-    10: (0.8, 1.0),
+    1: (2.5, 60.0),
+    2: (2.2, 45.0),
+    3: (2.0, 36.0),
+    4: (1.8, 30.0),
+    5: (1.6, 24.0),
+    6: (1.4, 18.0),
+    7: (1.2, 13.0),
+    8: (1.0, 9.0),
+    9: (0.9, 6.0),
+    10: (0.8, 5.0),
 }
 
 DEFAULT_SENSITIVITY = 5
@@ -59,8 +60,8 @@ def mood_timing(sensitivity: int) -> tuple[int, int]:
     except (TypeError, ValueError):
         level = DEFAULT_SENSITIVITY
     level = max(min(MOOD_TIMING), min(max(MOOD_TIMING), level))
-    dwell_seconds, timeout_minutes = MOOD_TIMING[level]
-    return round(dwell_seconds * 1000), round(timeout_minutes * 60_000)
+    dwell_seconds, timeout_seconds = MOOD_TIMING[level]
+    return round(dwell_seconds * 1000), round(timeout_seconds * 1000)
 
 
 def mood_asset(tag: str) -> str | None:

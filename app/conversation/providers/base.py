@@ -32,8 +32,21 @@ class Chunk:
     finished: bool = False
 
 
+#: 属于"配置没弄好"的 HTTP 状态：密钥 / 地址 / 模型名不对，改配置就能解决
+CONFIG_STATUS_CODES = frozenset({401, 403, 404})
+
+
 class ProviderError(RuntimeError):
-    """请求失败，文案可以直接展示给用户。"""
+    """请求失败，文案可以直接展示给用户。
+
+    ``config=True`` 表示这是"配置没弄好"这一类（没填 API、Key 不对、地址或模型名写错）：
+    界面统一提示用户去检查配置，**细节只留在开发者面板与运行日志里**——把
+    "401 鉴权失败：Authentication Fails" 这种原文丢给用户，除了劝退没别的用。
+    """
+
+    def __init__(self, message: str, config: bool = False) -> None:
+        super().__init__(message)
+        self.config = bool(config)
 
 
 class LLMProvider(Protocol):

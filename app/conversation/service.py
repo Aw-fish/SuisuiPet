@@ -42,6 +42,16 @@ DEFAULT_TIMEOUT = 60
 #: 让"开始专注 → 十分钟后暂停"这种前后关系断掉。
 EVENT_COOLDOWN = {"拖动": 20, "记事板": 10}
 
+#: 配置类问题（没填 API、Key / 地址 / 模型名不对）在界面上的统一说法。
+#: 具体报错（401 原文、连接失败原因）仍然进开发者面板与运行日志——把
+#: "401 鉴权失败，请检查环境变量里的 API Key：Authentication Fails" 甩给用户，
+#: 除了劝退没别的用。
+CONFIG_ERROR_TEXT = "该功能需要检查api配置！"
+
+#: 「测试连接」里的说法。那里本来就是"检查配置"的地方，把 401 原文摆出来没有意义，
+#: 所以配置类失败（没填地址 / Key、401/403/404）统统换成这一句。
+CONFIG_CHECK_TEXT = "请检查api配置！"
+
 
 def _as_float(value: Any, fallback: float) -> float:
     try:
@@ -67,20 +77,24 @@ def build_provider(info: dict) -> LLMProvider | None:
 
 
 def check_connection(info: dict) -> tuple[bool, str]:
-    """「测试连接」用：发一条极短请求，把报错直接翻译成可读文案。"""
+    """「测试连接」用：发一条极短请求，把报错直接翻译成可读文案。
+
+    配置类失败一律说 :data:`CONFIG_CHECK_TEXT`——用户点这个按钮就是在检查配置，
+    401 原文（"Authentication Fails"）摆在这里只会让人以为是网络问题。
+    """
     if not str(info.get("base_url", "")).strip():
-        return False, "没有配置 API 地址"
+        return False, CONFIG_CHECK_TEXT
     if not str(info.get("model", "")).strip():
-        return False, "没有配置模型名称"
+        return False, CONFIG_CHECK_TEXT
     if not str(info.get("api_key", "")).strip():
-        return False, "还没有填写 API Key"
+        return False, CONFIG_CHECK_TEXT
     provider = build_provider(info)
     if provider is None:
-        return False, "配置不完整"
+        return False, CONFIG_CHECK_TEXT
     try:
         model = provider.probe()  # type: ignore[attr-defined]
     except ProviderError as exc:
-        return False, str(exc)
+        return False, CONFIG_CHECK_TEXT if exc.config else str(exc)
     except Exception as exc:  # noqa: BLE001 - 网络层异常统一兜住
         return False, f"测试失败：{exc}"
     return True, f"连接成功，模型 {model} 可用"
@@ -111,6 +125,8 @@ class _StreamWorker(QThread):
         #: 这一轮攒下的推理内容（``reasoning_content``），收尾时交给开发者面板。
         #: 推理片段动辄上千个，不逐个发信号，只在这里累加。
         self.reasoning = ""
+        #: 失败原因是"配置没弄好"（Key / 地址 / 模型名）：界面该换成一句人话
+        self.config_error = False
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -163,6 +179,7 @@ class _StreamWorker(QThread):
                     self.delta.emit(chunk.delta)
         except ProviderError as exc:
             error = str(exc)
+            self.config_error = bool(getattr(exc, "config", False))
         except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
             error = f"请求出错：{exc}"
         # 收尾前把尾巴发出去，免得最后不满一个节流窗口的那几句卡在缓冲里
@@ -197,7 +214,7 @@ class ConsolidationWorker(QThread):
         try:
             added, merged = consolidate_pending(self._store, provider)
         except ProviderError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(CONFIG_ERROR_TEXT if getattr(exc, "config", False) else f"整理记忆失败：{exc}")
             return
         except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
             self.failed.emit(f"整理记忆失败：{exc}")
@@ -231,6 +248,9 @@ class ConversationService(QObject):
         self._splitter = SentenceSplitter()
         self._tag_filter = TagFilter()
         self._clean: list[str] = []
+        #: 这一轮追加进历史的用户消息 / 事件消息。请求失败且一个字都没产出时用它撤回——
+        #: 模型压根没看到这条消息，就不该留在历史里被当成"用户说过的话"。
+        self._round_message: Message | None = None
         #: 本轮从回复里剥掉了多少个表情标记（只给开发者面板看）
         self._tag_count = 0
         self._auto_expression = False
@@ -370,12 +390,13 @@ class ConversationService(QObject):
             return provider
         devtools.log.warning("对话 · 无法发送：没有配置 API 地址或模型名称")
         if report:
-            self.failed.emit("没有配置 API 地址或模型名称，请到设置 → 角色设置里填写")
+            self.failed.emit(CONFIG_ERROR_TEXT)
         return None
 
     def _start(self, provider: LLMProvider, user_message: Message, query: str) -> None:
         """把一轮请求真正发出去：重置状态 → 记录参数 → 组装上下文 → 起线程。"""
         assert self._memory is not None          # 两个调用方都先查过
+        self._round_message = user_message
         self._tag_filter.reset()
         self._clean.clear()
         self._tag_count = 0
@@ -498,6 +519,8 @@ class ConversationService(QObject):
         interrupted = bool(worker is not None and worker.cancelled)
         #: 推理内容也算这一次的产出（推理模型可能几千 token 都在这里）
         reasoning = worker.reasoning if worker is not None else ""
+        #: 失败属于"配置没弄好"：界面只提示去检查配置，细节留在日志与面板里
+        config_error = bool(worker is not None and worker.config_error)
         # 模型明确表示"不作回应"（事件轮常见）：界面什么都不显示，但这一轮照样留在
         # 历史与日志里——上下文不断档，翻日志也看得出它看到了什么、选择了什么
         silent = not error and not interrupted and is_silent(text)
@@ -511,6 +534,13 @@ class ConversationService(QObject):
                     interrupted=interrupted,
                 )
             )
+        if error and not text and not interrupted and self._memory is not None and self._round_message is not None:
+            # 请求失败且一个字都没产出：模型压根没看到这条消息（Key 不对、连不上），
+            # 那就撤回刚写进历史的那一条——否则以后整理记忆时，会把"没人回应的话"
+            # 当成用户确实说过的事记下来。
+            if self._memory.discard(self._round_message):
+                devtools.log.info("对话 · 这一轮没送出去，已撤回刚写入的历史")
+        self._round_message = None
         first = total = 0.0
         if self._started_at is not None:
             total = time.monotonic() - self._started_at
@@ -549,7 +579,8 @@ class ConversationService(QObject):
             )
         self.busy_changed.emit(False)
         if error:
-            self.failed.emit(error)
+            # 配置类问题给一句人话；其余照实报（"出错："前缀统一在这里加，界面原样显示）
+            self.failed.emit(CONFIG_ERROR_TEXT if config_error else f"出错：{error}")
         elif silent:
             devtools.log.info("对话 · 未作回应（已记入会话日志，界面不显示）")
             self.silenced.emit()

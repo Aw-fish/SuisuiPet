@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPush
 from app import characters, devtools
 from app.config import load_settings, save_settings
 from app.conversation.message import ROLE_ASSISTANT, ROLE_USER, is_silent
-from app.conversation.service import ConversationService
+from app.conversation.service import CONFIG_ERROR_TEXT, ConversationService
 from app.pet.animator import SpriteAnimator
 from app.pet.character_sprite import CharacterAssets
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
@@ -462,7 +462,7 @@ class ChatDialog(QDialog):
         self._reset_timer.stop()
         label = self._stream_label
         self._stream_label = None
-        text = f"出错：{message}"
+        text = message          # 文案由服务层给全（普通错误带「出错：」前缀，配置类另行提示）
         if label is not None and not label.text():
             label.setText(text)
             label.setFixedWidth(self._bubble_width(label, text))
@@ -783,7 +783,7 @@ class PetCanvas(QWidget):
 
 class PetWindow(QWidget):
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None], notify: Callable[[str, str], None] | None = None) -> None:
-        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.notify = notify; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self._pomodoro_total = 0; self.following = False; self._think_until = 0.0; self._menu_open = False; self._reply_form = FORM_WINDOW; self._speech_buffer = ''; self._speech_shown = ''; self._drag_origin = QPoint(0, 0); self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
+        super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.notify = notify; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self._pomodoro_total = 0; self.following = False; self._think_until = 0.0; self._menu_open = False; self._reply_form = FORM_WINDOW; self._speech_buffer = ''; self._speech_shown = ''; self._drag_origin = QPoint(0, 0); self._config_error = False; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
         self.canvas = PetCanvas(self); self.bubble = QLabel(self); self.bubble.setAlignment(Qt.AlignCenter); self.bubble.setStyleSheet('background:rgba(255,255,255,235); color:#645C73; border:1px solid #EEEAF6; border-radius:12px; font-size:11px;'); self.bubble.hide()
         self._sync_geometry()
@@ -1068,9 +1068,15 @@ class PetWindow(QWidget):
         self.animation.setStartValue(self.pos()); self.animation.setEndValue(target)
         self.animation.setDuration(max(80, round(moved/MOVE_SPEED*1000))); self.animation.start()
     def apply_settings(self, data:dict)->None:
-        # 对话窗/输入框的开关已取消：只由右键菜单打开；保存设置只做一件事——
-        # 换了对话形式就把另一种收起来，免得两个入口同时挂着
+        # 对话窗/输入框的开关已取消：只由右键菜单打开；保存设置只做两件事——
+        # 换了对话形式就把另一种收起来，免得两个入口同时挂着；以及收拾"配置没弄好"的残留
         self.load_character(data); self.show_pet()
+        if self._config_error:
+            # 上一轮提示过"该功能需要检查api配置！"，现在用户保存了设置：
+            # 把那条提示连同失败那轮的痕迹一起清掉（失败的消息本来就没进历史）
+            self._config_error = False
+            self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
+            self.speech.dismiss()
         if self._reply_form == FORM_BUBBLE: self.chat.hide()
         else: self.input_box.hide()
         if self.isVisible(): self.say('设置已保存')
@@ -1101,8 +1107,10 @@ class PetWindow(QWidget):
         self._speech_timer.stop(); self._speech_buffer = ''; self._speech_shown = ''
     def _on_reply_failed(self, message: str) -> None:
         self._speech_timer.stop(); self._speech_buffer = ''; self._speech_shown = ''
+        # 记着"这次是配置没弄好"：用户改完配置保存时，把这条提示清掉，别一直挂着
+        self._config_error = message == CONFIG_ERROR_TEXT
         if self._reply_form != FORM_BUBBLE: return
-        self.speech.show_text(f'出错：{message}', hold_ms=self._speech_hold_ms())
+        self.speech.show_text(message, hold_ms=self._speech_hold_ms())
     def _send_from_input(self, text: str) -> None:
         """漂浮输入框发出去的消息。
 
