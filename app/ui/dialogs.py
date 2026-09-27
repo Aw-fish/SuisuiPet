@@ -20,29 +20,21 @@ ACCENT = "#917DE8"
 
 
 class WheelGuard(QObject):
-    """屏蔽滚轮事件：鼠标划过数值控件时不要改动数值，太容易误触。
-
-    设置页本身是可滚动区域，滚页面时笔尖正好压在滑块 / 数字框 / 下拉框上，
-    数值就被顺手改掉了——这类"看一眼就改了"的误触比少一个便捷操作麻烦得多。
-    """
-
+    """屏蔽滚轮事件"""
     def eventFilter(self, watched, event):  # type: ignore[no-untyped-def]
         if event.type() == QEvent.Type.Wheel:
             event.ignore()
             return True
         return super().eventFilter(watched, event)
 
-
 def block_wheel(owner: QWidget, *widgets: QWidget) -> WheelGuard:
-    """让这些控件不吃滚轮。``owner`` 同时是拦截器的 parent，保证它不会被提前回收。"""
     guard = WheelGuard(owner)
     for widget in widgets:
         widget.installEventFilter(guard)
     return guard
 
-#: (key, 按钮文案, 样式)；样式取值 primary / ghost / danger
-Option = tuple[str, str, str]
 
+Option = tuple[str, str, str]
 
 class StyledDialog(QDialog):
     """无边框、圆角的轻量对话框，支持输入框与 1~3 个自定义按钮。"""

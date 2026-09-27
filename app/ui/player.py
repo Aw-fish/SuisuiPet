@@ -1,6 +1,6 @@
 """按固定间隔播放一串音效（QtMultimedia，不引入新依赖）。
 
-只在 **GUI 线程**里跑：技能在请求线程里通过 Qt 信号把"要唱什么"送过来（跨线程发信号
+只在 **GUI 线程**里跑：技能在请求线程里通过 Qt 信号把"要演奏什么"送过来（跨线程发信号
 是安全的），槽函数在这里排期播放。
 
 每个音缓存两个播放器轮流用：像 `1 1 1` 这样的连音，只用一个播放器会把前一个音掐断，
@@ -23,10 +23,10 @@ LAST_TAIL_MS = 900
 MIN_INTERVAL_MS = 100
 
 
-class Singer(QObject):
+class MelodyPlayer(QObject):
     """把一串音效按间隔放出来；播放期间随时可以 :meth:`stop`。"""
 
-    #: 唱完了（自然放完或被打断）——界面据此把动作恢复回去
+    #: 演奏完了（自然放完或被打断）——界面据此把动作恢复回去
     finished = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -76,7 +76,7 @@ class Singer(QObject):
         return total
 
     def stop(self) -> None:
-        """停下并清空队列；只有"本来在唱"时才通知 ``finished``。"""
+        """停下并清空队列；只有"本来在演奏"时才通知 ``finished``。"""
         if not self._playing:
             return
         self._abort()
@@ -101,7 +101,7 @@ class Singer(QObject):
             player, _ = self._voice(beat)
             player.setSource(QUrl.fromLocalFile(str(beat)))
             player.play()
-        # 每次都排一次：队列空了以后到点就是"唱完了"（空拍同样占一拍）
+        # 每次都排一次：队列空了以后到点就是"演奏完了"（空拍同样占一拍）
         self._timer.start(self._interval if self._queue else max(self._interval, LAST_TAIL_MS))
 
     def _voice(self, path: Path) -> tuple[QMediaPlayer, QAudioOutput]:

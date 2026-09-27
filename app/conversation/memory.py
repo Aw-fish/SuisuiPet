@@ -28,6 +28,7 @@ from app.conversation.message import (
     INTERRUPT_HINT,
     NARRATION_HINT,
     PREFIX_HINT,
+    ROLE_TOOL,
     Message,
     ROLE_ASSISTANT,
     ROLE_SYSTEM,
@@ -202,6 +203,36 @@ def _day_suffix(entry: MemoryEntry) -> str:
         return ""
     day = clock.day_text(entry.ts)
     return f"，{day}" if day else ""
+
+
+def _trim_tool_pairs(messages: list[Message]) -> list[Message]:
+    """把窗口边界上的工具轮次修齐：要么整对留着，要么整对丢掉。
+
+    助手侧带 ``tool_calls`` 的消息后面**必须**紧跟对应的 ``tool`` 结果，少一条或顺序不对，
+    接口会直接拒掉整次请求；而窗口是按"最近 N 条"切的，很容易正好切在配对中间。
+    """
+    cleaned: list[Message] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not message.tool_calls:
+            # 孤零零的 tool 结果（它那条助手调用被截掉了）不留
+            if message.role != ROLE_TOOL:
+                cleaned.append(message)
+            index += 1
+            continue
+        wanted = [str(call.get("id") or "") for call in message.tool_calls]
+        following = messages[index + 1: index + 1 + len(wanted)]
+        got = [item.tool_call_id for item in following if item.role == ROLE_TOOL]
+        if got == wanted:
+            cleaned.append(message)
+            cleaned.extend(following)
+            index += 1 + len(wanted)
+            continue
+        # 这一组不全：整组剔除。宁可少给一轮上下文，也不能发一次必然被拒的请求
+        devtools.log.warning("记忆 · 工具轮次不成对，已从上下文里整组剔除（%d 条）", 1 + len(following))
+        index += 1 + len(following)
+    return cleaned
 
 
 class MemoryStore:
@@ -779,16 +810,20 @@ class MemoryStore:
     ) -> list[dict[str, Any]]:
         # 被打断的回复即便一个字都没生成也要留下：它在上下文里会带上 INTERRUPT_MARK，
         # 让模型知道自己上次被掐断了，而不是以为那轮什么都没说。
+        # 进窗口的消息：用户与助手的正文，外加**成对的工具轮次**——模型得知道自己刚才调用了
+        # 什么、拿到了什么，否则它只看得到自己最后那句话，等于每轮都从零开始猜。
+        # 带 tool_calls 的助手消息与 tool 结果必须成对出现，按条数截断时由 _trim_tool_pairs
+        # 把边界修齐：要么整对留着，要么整对丢掉。
         history = [
             message
             for message in self.load()
-            if message.role in (ROLE_USER, ROLE_ASSISTANT)
-            and (message.content.strip() or message.interrupted)
-            # 工具轮次不进上下文：助手侧的 tool_calls 必须与紧随其后的 tool 结果成对出现，
-            # 只带一条过去接口会直接拒掉；而且那一轮查到的东西已经落在它的回复里了
-            and not message.tool_calls
+            if message.role == ROLE_TOOL
+            or (
+                message.role in (ROLE_USER, ROLE_ASSISTANT)
+                and (message.content.strip() or message.interrupted or message.tool_calls)
+            )
         ]
-        recent = history[-max(1, limit):]
+        recent = _trim_tool_pairs(history[-max(1, limit):])
         sections: list[str] = []
         if system_prompt.strip():
             sections.append(system_prompt.strip())
@@ -802,7 +837,7 @@ class MemoryStore:
             # 只有窗口里真的带着事件行时才解释这套标记，平时不花这份 token
             marks.append(EVENT_HINT)
         if any(message.prefix for message in recent):
-            # 动作前缀（[打断唱歌] 这类）同理：出现时才解释它是怎么回事
+            # 动作前缀（[打断演奏] 这类）同理：出现时才解释它是怎么回事
             marks.append(PREFIX_HINT)
         if marks:
             sections.append(f"{prompts.MARKS}\n" + "\n".join(marks))

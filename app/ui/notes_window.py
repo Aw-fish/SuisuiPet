@@ -1,9 +1,4 @@
-"""记事板窗口：随手记点东西，实时存本地。
-
-它和桌宠只有两条关系：认桌宠当 parent（于是同属一层、跟着一起显隐），以及**写入时**
-通过 ``on_write`` 告诉模型"有人在记事板上写了东西"——**正文不出门**，模型只知道这件事
-发生过（想聊就自己问）。冷却交给事件层（``service.EVENT_COOLDOWN``）。
-"""
+"""记事板窗口"""
 
 from __future__ import annotations
 
@@ -23,17 +18,17 @@ from PySide6.QtWidgets import (
 from app import devtools
 from app.paths import NOTES_PATH
 
-#: 记事板窗口尺寸（首次打开时的初始值，之后可以自己拖边框改）
+#: 记事板窗口尺寸
 WINDOW_SIZE = (330, 260)
-#: 最小尺寸：再小就写不下几行字了
+#: 最小尺寸
 MIN_SIZE = (220, 150)
-#: 鼠标离边缘这么近就当抓住了边框（像素）
+#: 抓住边框
 RESIZE_MARGIN = 6
-#: 停笔多久才落盘 / 告诉模型（毫秒）。「实时保存」没必要每个键都写一次文件。
+#: 保存间隔
 SAVE_DELAY_MS = 500
 #: 与角色之间的留白
 MARGIN = 12
-#: 记事板背景不透明度（百分比）的取值范围与默认值。设置项是 ``tools.notes_opacity``。
+#: 记事板背景不透明度（百分比）的取值范围与默认值。
 NOTES_OPACITY_MIN, NOTES_OPACITY_MAX, NOTES_OPACITY_DEFAULT = 30, 100, 90
 
 
@@ -93,7 +88,7 @@ class NotesWindow(QWidget):
     # ---- 存取 ---------------------------------------------------------------
 
     def load(self) -> None:
-        """从本地读回内容；文件还没建就是空的。"""
+        """从本地读回内容"""
         try:
             body = NOTES_PATH.read_text(encoding="utf-8") if NOTES_PATH.is_file() else ""
         except OSError as error:
@@ -104,7 +99,7 @@ class NotesWindow(QWidget):
         self._loading = False
 
     def _schedule_save(self) -> None:
-        # 载入时也会触发 textChanged，那不是"用户写了字"，不该惊动任何人
+        # 载入时也会触发 textChanged
         if not self._loading:
             self._save_timer.start()
 

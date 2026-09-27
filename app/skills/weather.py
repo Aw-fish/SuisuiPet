@@ -29,7 +29,7 @@ CACHE_SECONDS = 600
 #: 城市名 → 经纬度的结果也缓存久一点：地名解析很少变
 GEOCODE_CACHE_SECONDS = 24 * 3600
 
-#: WMO 天气码 → 中文说法（Open-Meteo 用的就是这套码）
+#: WMO 天气码 → 天气（Open-Meteo）
 _WMO: dict[int, str] = {
     0: "晴",
     1: "晴间少云",
@@ -116,8 +116,7 @@ class WeatherSkill:
         city = str(arguments.get("city") or "").strip() or self._default_city()
         if not city:
             return (
-                "还不知道用户在哪个城市：设置里没有默认城市，你也没有别的依据。"
-                "请先问用户所在城市，拿到之后再调用一次本工具并把城市填进 city。"
+                "还不知道用户在哪个城市：请先问用户所在城市，拿到之后再调用一次本工具并把城市填进 city"
             )
         days = self._days(arguments.get("days"))
         key = f"{city}|{days}"
@@ -195,7 +194,7 @@ class WeatherSkill:
         )
         response.raise_for_status()
         body = response.json()
-        lines = [f"【天气】{self._place_name(place)}（数据来自 Open-Meteo）"]
+        lines = [f"【天气】{self._place_name(place)}"]
         current = body.get("current") or {}
         if current:
             lines.append(

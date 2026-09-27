@@ -16,7 +16,7 @@ from app import characters, devtools, paths
 from app.conversation.service import check_connection
 from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
-from app.skills.sing import DEFAULT_INTERVAL_MS, INTERVAL_RANGE, audio_paths, note_name
+from app.skills.play import DEFAULT_INTERVAL_MS, INTERVAL_RANGE, audio_paths, note_name
 from app.ui.dev_window import DevWindow
 from app.ui.dialogs import StyledDialog, WheelGuard, block_wheel
 from app.ui.icons import app_icon
@@ -25,8 +25,6 @@ from app.ui.menus import styled_menu
 
 
 class _ConnectWorker(QThread):
-    """在后台跑「测试连接」，避免界面卡住。"""
-
     done = Signal(bool, str)
 
     def __init__(self, info: dict, parent: QWidget | None = None) -> None:
@@ -45,16 +43,14 @@ class _ConnectWorker(QThread):
 
 
 #: 「基础提示词」的固定高度，同时也是「角色提示词」自动增高的上限
-BASE_PROMPT_HEIGHT = 146
+BASE_PROMPT_HEIGHT = 150
 #: 「角色提示词」的起始高度
 CHARACTER_PROMPT_HEIGHT = 110
 
 
 class GrowingTextEdit(QTextEdit):
-    """随内容自动增高、到上限为止的输入框。
-
-    高度按文档排版后的真实高度算；``_chrome``（边框 + 内边距）用实测差值取，
-    这样不必关心样式表里写的是多少 padding。
+    """输入框
+    高度按文档排版后的真实高度算；``_chrome``（边框 + 内边距）用实测差值取
     """
 
     def __init__(self, minimum: int, maximum: int, parent: QWidget | None = None) -> None:
@@ -152,7 +148,7 @@ class SettingsWindow(QMainWindow):
         nav = QVBoxLayout(sidebar)
         nav.setContentsMargins(14, 22, 14, 18)
         nav.addWidget(QLabel("SuisuiPet", objectName="brand"))
-        # nav.addWidget(QLabel("陪伴在桌面的一小段时间", objectName="hint"))
+        # nav.addWidget(QLabel("一只桌宠", objectName="hint"))
         nav.addSpacing(24)
         self.stack = QStackedWidget()
         self.group = QButtonGroup(self)
@@ -165,7 +161,7 @@ class SettingsWindow(QMainWindow):
             if i == 0:
                 button.setChecked(True)
         nav.addStretch()
-        nav.addWidget(QLabel("MVP · 本地设置", objectName="hint"))
+        nav.addWidget(QLabel("demo", objectName="hint"))
         content = QFrame(objectName="content")
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(42, 25, 42, 28)
@@ -225,23 +221,23 @@ class SettingsWindow(QMainWindow):
         return QLabel(text, objectName="label")
 
     def _character_page(self) -> QWidget:
-        page, layout = self._page("角色设置", "每个角色存储在独立文件夹，包含立绘、对话配置与记忆。")
+        page, layout = self._page("角色设置", "每个角色存储在独立文件夹")
         layout.addWidget(self._label("角色选择"))
         picker = QHBoxLayout()
         picker.setSpacing(8)
         self.character = ComboBox()
         self.character.currentTextChanged.connect(self._on_character_changed)
         self.add_character = QPushButton("添加角色", objectName="mini")
-        self.add_character.setToolTip("新建一个角色文件夹")
+        self.add_character.setToolTip("新建角色文件夹")
         self.add_character.clicked.connect(self._add_character)
         self.import_character_button = QPushButton("导入角色", objectName="mini")
-        self.import_character_button.setToolTip("复制一个已有的角色文件夹进来")
+        self.import_character_button.setToolTip("复制已有的角色文件夹")
         self.import_character_button.clicked.connect(self._import_character)
         self.remove_character = QPushButton("删除角色", objectName="mini")
-        self.remove_character.setToolTip("断开连接或连同数据一起删除")
+        self.remove_character.setToolTip("断开连接或删除数据")
         self.remove_character.clicked.connect(self._remove_character)
         self.memory_button = QPushButton("记忆", objectName="mini")
-        self.memory_button.setToolTip("查看与整理这个角色的长期记忆")
+        self.memory_button.setToolTip("查看与整理长期记忆")
         self.memory_button.clicked.connect(self._open_memory_window)
         picker.addWidget(self.character, 1)
         picker.addWidget(self.add_character)
@@ -260,7 +256,6 @@ class SettingsWindow(QMainWindow):
         self.format_group.addButton(self.live2d_format)
         self.img_format.toggled.connect(self._on_format_changed)
         self.live2d_format.toggled.connect(self._on_live2d_toggled)
-        # live2d 还没做完：选中就提示一句并切回立绘。提示平时藏着，点到了才出来
         self.live2d_hint = QLabel("该功能施工中> <", objectName="hint")
         self.live2d_hint.hide()
         formats.addWidget(self.img_format)
@@ -306,11 +301,11 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(self._label("API Key"))
         self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.Password)
-        self.key.setPlaceholderText("仅保存在本机，character.json 不会被上传")
+        self.key.setPlaceholderText("保存在本地")
         layout.addWidget(self.key)
         layout.addWidget(self._label("代理（可留空）"))
         self.proxy = QLineEdit()
-        self.proxy.setPlaceholderText("留空 = 直连并忽略系统代理")
+        self.proxy.setPlaceholderText("：直连并忽略系统代理")
         layout.addWidget(self.proxy)
         params = QHBoxLayout()
         params.setSpacing(12)
@@ -332,7 +327,7 @@ class SettingsWindow(QMainWindow):
         layout.addLayout(params)
         layout.addWidget(self._label("角色提示词"))
         self.prompt = GrowingTextEdit(CHARACTER_PROMPT_HEIGHT, BASE_PROMPT_HEIGHT)
-        self.prompt.setPlaceholderText("描述角色的人设性格、语气与对话边界……")
+        self.prompt.setPlaceholderText("描述角色的人设性格、语气与对话边界...")
         layout.addWidget(self.prompt)
         test_row = QHBoxLayout()
         test_row.setSpacing(10)
@@ -354,7 +349,7 @@ class SettingsWindow(QMainWindow):
         dwell_ms, timeout_ms = mood_timing(value)
         self.sensitivity_hint.setText(
             f"参数越高，表情切换越快：最短停留 {dwell_ms / 1000:g} 秒，"
-            f"{timeout_ms / 1000:g} 秒没有新情绪就回到默认立绘。"
+            f"{timeout_ms / 1000:g} 秒切回默认立绘。"
         )
 
     def _on_auto_expression_toggled(self, checked: bool) -> None:
@@ -374,12 +369,12 @@ class SettingsWindow(QMainWindow):
         self.bubble_opacity_value.setText(f"{value}%")
 
     def _mode_page(self) -> QWidget:
-        page, layout = self._page("模式设置", "控制角色在桌面上的行为，以及对所有角色生效的对话风格。")
+        page, layout = self._page("模式设置", "控制角色行为和全局对话规则。")
         layout.addWidget(self._label("角色动作模式"))
         self.movable, self.stationary = QRadioButton("自由移动"), QRadioButton("固定位置")
         self.motion_group = QButtonGroup(self)
         self.motion_group.addButton(self.movable); self.motion_group.addButton(self.stationary)
-        layout.addWidget(self.movable); layout.addWidget(QLabel("允许在桌面上移动。", objectName="hint"))
+        layout.addWidget(self.movable); layout.addWidget(QLabel("在桌面上随机移动。", objectName="hint"))
         layout.addWidget(self.stationary); layout.addWidget(QLabel("固定在当前位置。", objectName="hint"))
         layout.addSpacing(20)
         layout.addWidget(self._label("自动表情"))
@@ -387,8 +382,8 @@ class SettingsWindow(QMainWindow):
         self.auto_expression.setToolTip("开启后提示词里会追加表情标记说明，模型在回复中标出的表情会切换立绘")
         self.auto_expression.toggled.connect(self._on_auto_expression_toggled)
         layout.addWidget(self.auto_expression)
-        layout.addWidget(QLabel("关闭后不再注入表情说明，节省部分token。", objectName="hint"))
-        layout.addWidget(self._label("表情切换灵敏度"))
+        layout.addWidget(QLabel("关闭后对话中不再注入表情说明", objectName="hint"))
+        layout.addWidget(self._label("表情切换间隔"))
         sensitivity_row = QHBoxLayout()
         sensitivity_row.setSpacing(10)
         self.expression_sensitivity = QSlider(Qt.Horizontal)
@@ -413,9 +408,9 @@ class SettingsWindow(QMainWindow):
         self.form_group.addButton(self.form_window); self.form_group.addButton(self.form_bubble)
         self.form_bubble.toggled.connect(self._on_form_toggled)
         layout.addWidget(self.form_window)
-        layout.addWidget(QLabel("独立的聊天窗口，历史最完整。", objectName="hint"))
+        layout.addWidget(QLabel("独立聊天窗口", objectName="hint"))
         layout.addWidget(self.form_bubble)
-        layout.addWidget(QLabel("在角色旁打字，回复显示在角色上方的对白框里（同一段会话）。", objectName="hint"))
+        layout.addWidget(QLabel("对话式聊天", objectName="hint"))
         layout.addWidget(self._label("对白停留时长"))
         hold_row = QHBoxLayout()
         hold_row.setSpacing(10)
@@ -430,7 +425,7 @@ class SettingsWindow(QMainWindow):
         hold_row.addWidget(self.bubble_seconds, 1)
         hold_row.addWidget(self.bubble_seconds_value)
         layout.addLayout(hold_row)
-        layout.addWidget(QLabel("对白几秒后自动消失；新回复直接覆盖它，点一下对白也能立刻关掉。", objectName="hint"))
+        layout.addWidget(QLabel("对白会自动消失，或由新回复覆盖", objectName="hint"))
         layout.addWidget(self._label("对白不透明度"))
         alpha_row = QHBoxLayout()
         alpha_row.setSpacing(10)
@@ -445,7 +440,7 @@ class SettingsWindow(QMainWindow):
         alpha_row.addWidget(self.bubble_opacity, 1)
         alpha_row.addWidget(self.bubble_opacity_value)
         layout.addLayout(alpha_row)
-        layout.addWidget(QLabel("越高越不透明（30%~100%），只影响角色上方那个对白框。", objectName="hint"))
+        layout.addWidget(QLabel("越高越不透明（30%~100%）", objectName="hint"))
         layout.addSpacing(20)
         layout.addWidget(self._label("全局提示词（对所有角色生效）"))
         self.base_prompt = QTextEdit()
@@ -469,7 +464,7 @@ class SettingsWindow(QMainWindow):
         self.base_prompt.setPlainText(BASE_SYSTEM_PROMPT)
 
     def _tools_page(self) -> QWidget:
-        page, layout = self._page("工具", "设置桌宠提供的轻量日常工具。")
+        page, layout = self._page("工具", "日常工具设置")
         layout.addWidget(self._label("番茄钟时长（分钟）"))
         self.pomodoro = QSpinBox(); self.pomodoro.setRange(5, 120); self.pomodoro.setSuffix(" 分钟")
         layout.addWidget(self.pomodoro)
@@ -488,15 +483,15 @@ class SettingsWindow(QMainWindow):
         notes_row.addWidget(self.notes_opacity, 1)
         notes_row.addWidget(self.notes_opacity_value)
         layout.addLayout(notes_row)
-        layout.addWidget(QLabel("越高越不透明（30%~100%），只影响记事板。", objectName="hint"))
+        layout.addWidget(QLabel("（30%~100%）", objectName="hint"))
         layout.addSpacing(18)
-        layout.addWidget(self._label("记事板窗口位置"))
+        layout.addWidget(self._label("记事板窗口默认位置"))
         self.notes_pet, self.notes_corner, self.notes_center = QRadioButton("角色旁"), QRadioButton("屏幕右下角"), QRadioButton("屏幕中间")
         self.notes_group = QButtonGroup(self)
         for button in (self.notes_pet, self.notes_corner, self.notes_center):
             self.notes_group.addButton(button)
             layout.addWidget(button)
-        layout.addWidget(QLabel("每次打开记事板时出现在哪；之后拖到别处也只影响这一次。", objectName="hint"))
+        layout.addWidget(QLabel("每次打开记事板时出现位置", objectName="hint"))
         layout.addStretch()
         return page
 
@@ -506,111 +501,106 @@ class SettingsWindow(QMainWindow):
     def _skills_page(self) -> QWidget:
         page, layout = self._page(
             "技能",
-            "让角色自己动手的能力：模型判断需要时才会去调用，你在开发者面板里能看到它查了什么、拿回什么。",
+            "让角色自己动手的能力：模型判断需要时才会调用，你在开发者面板里能看到它调了什么、拿回什么。",
         )
+        self.skills_enabled = QCheckBox("启用工具")
+        self.skills_enabled.setToolTip("关掉后所有工具的说明都不会发给模型，它就不会再调用任何工具")
+        self.skills_enabled.toggled.connect(self._on_skills_toggled)
+        layout.addWidget(self.skills_enabled)
+        layout.addWidget(QLabel("关掉后连工具说明都不会发出去，模型自然无从调用。", objectName="hint"))
+        layout.addSpacing(20)
         layout.addWidget(self._label("天气查询"))
-        self.weather_enabled = QCheckBox("允许角色查天气")
-        self.weather_enabled.setToolTip("关掉后连工具说明都不会发给模型，它就无从调用")
-        self.weather_enabled.toggled.connect(self._on_weather_toggled)
-        layout.addWidget(self.weather_enabled)
-        layout.addWidget(QLabel("数据来自 Open-Meteo，免 Key，需要能上网。", objectName="hint"))
+        layout.addWidget(QLabel("数据来自 Open-Meteo，需联网", objectName="hint"))
         layout.addSpacing(18)
         layout.addWidget(self._label("默认城市（可留空）"))
         self.weather_city = QLineEdit()
         self.weather_city.setPlaceholderText("例如：上海")
         layout.addWidget(self.weather_city)
-        layout.addWidget(QLabel(
-            "用户没说到城市时用它。留空就让角色先问你在哪儿；你在对话里说过的城市会记进长期记忆，"
-            "角色下次会照着用——也可以随时在对话里换一个城市。",
-            objectName="hint",
-        ))
         layout.addSpacing(24)
-        layout.addWidget(self._label("唱歌"))
-        self.sing_enabled = QCheckBox("允许角色唱歌")
-        self.sing_enabled.setToolTip("关掉后连工具说明都不会发给模型，它就无从调用")
-        self.sing_enabled.toggled.connect(self._on_sing_toggled)
-        layout.addWidget(self.sing_enabled)
+        layout.addWidget(self._label("演奏"))
         layout.addWidget(QLabel(
             f"把音效放进 {paths.AUDIO_DIR}：1.mp3 ~ 8.mp3（简谱 1=do、2=re、…、7=si、8=高音 do），"
             "每个约 1 秒。也认唱名命名（do.mp3 / sol.mp3 / do2.mp3）。",
             objectName="hint",
         ))
-        self.sing_files = QLabel("", objectName="hint")
-        self.sing_files.setWordWrap(True)
-        layout.addWidget(self.sing_files)
+        self.play_files = QLabel("", objectName="hint")
+        self.play_files.setWordWrap(True)
+        layout.addWidget(self.play_files)
         layout.addWidget(self._label("音符间隔"))
         interval_row = QHBoxLayout()
         interval_row.setSpacing(10)
-        self.sing_interval = QSlider(Qt.Horizontal)
-        self.sing_interval.setRange(*INTERVAL_RANGE)
-        self.sing_interval.setSingleStep(50)
-        self.sing_interval.setFixedHeight(24)
-        self.sing_interval.valueChanged.connect(self._on_sing_interval_changed)
-        self.sing_interval_value = QLabel(objectName="chip")
-        self.sing_interval_value.setAlignment(Qt.AlignCenter)
-        self.sing_interval_value.setFixedWidth(64)
-        interval_row.addWidget(self.sing_interval, 1)
-        interval_row.addWidget(self.sing_interval_value)
+        self.play_interval = QSlider(Qt.Horizontal)
+        self.play_interval.setRange(*INTERVAL_RANGE)
+        self.play_interval.setSingleStep(50)
+        self.play_interval.setFixedHeight(24)
+        self.play_interval.valueChanged.connect(self._on_play_interval_changed)
+        self.play_interval_value = QLabel(objectName="chip")
+        self.play_interval_value.setAlignment(Qt.AlignCenter)
+        self.play_interval_value.setFixedWidth(64)
+        interval_row.addWidget(self.play_interval, 1)
+        interval_row.addWidget(self.play_interval_value)
         layout.addLayout(interval_row)
         layout.addWidget(QLabel(
-            "音效长约 1 秒：间隔越短越连成旋律，越长越像一个个单音。"
-            "速度通常由模型按曲子的情绪自己定（抒情慢、欢快快），这里填的是它没说时用的默认值。",
+            "音效长约 1 秒；"
+            "此处为速度默认值",
             objectName="hint",
         ))
         layout.addWidget(self._label("音量"))
         volume_row = QHBoxLayout()
         volume_row.setSpacing(10)
-        self.sing_volume = QSlider(Qt.Horizontal)
-        self.sing_volume.setRange(0, 100)
-        self.sing_volume.setSingleStep(5)
-        self.sing_volume.setFixedHeight(24)
-        self.sing_volume.valueChanged.connect(self._on_sing_volume_changed)
-        self.sing_volume_value = QLabel(objectName="chip")
-        self.sing_volume_value.setAlignment(Qt.AlignCenter)
-        self.sing_volume_value.setFixedWidth(52)
-        volume_row.addWidget(self.sing_volume, 1)
-        volume_row.addWidget(self.sing_volume_value)
+        self.play_volume = QSlider(Qt.Horizontal)
+        self.play_volume.setRange(0, 100)
+        self.play_volume.setSingleStep(5)
+        self.play_volume.setFixedHeight(24)
+        self.play_volume.valueChanged.connect(self._on_play_volume_changed)
+        self.play_volume_value = QLabel(objectName="chip")
+        self.play_volume_value.setAlignment(Qt.AlignCenter)
+        self.play_volume_value.setFixedWidth(52)
+        volume_row.addWidget(self.play_volume, 1)
+        volume_row.addWidget(self.play_volume_value)
         layout.addLayout(volume_row)
         layout.addStretch()
         return page
 
-    def _on_weather_toggled(self, checked: bool) -> None:
-        self.weather_city.setEnabled(checked)
-
-    def _on_sing_toggled(self, checked: bool) -> None:
-        for widget in (self.sing_interval, self.sing_interval_value, self.sing_volume, self.sing_volume_value):
+    def _on_skills_toggled(self, checked: bool) -> None:
+        """总开关：关掉后下面这些参数也没意义了，一并灰掉。"""
+        for widget in (
+            self.weather_city,
+            self.play_interval, self.play_interval_value,
+            self.play_volume, self.play_volume_value,
+        ):
             widget.setEnabled(checked)
 
-    def _on_sing_interval_changed(self, value: int) -> None:
-        self.sing_interval_value.setText(f"{value} 毫秒")
+    def _on_play_interval_changed(self, value: int) -> None:
+        self.play_interval_value.setText(f"{value} 毫秒")
 
-    def _on_sing_volume_changed(self, value: int) -> None:
-        self.sing_volume_value.setText(f"{value}%")
+    def _on_play_volume_changed(self, value: int) -> None:
+        self.play_volume_value.setText(f"{value}%")
 
-    def _refresh_sing_files(self) -> None:
-        """提示现在认得几个音——八个放齐才唱得完整。"""
+    def _refresh_play_files(self) -> None:
+        """音效库检验"""
         found = sorted(audio_paths())
         if not found:
-            self.sing_files.setText("这个目录里还没有可用的音效（放几个进去就能唱了）。")
+            self.play_files.setText("这个目录里还没有可用的音效。")
             return
         names = "、".join(f"{note}({note_name(note)})" for note in found)
-        self.sing_files.setText(f"已经认出 {len(found)} 个音：{names}")
+        self.play_files.setText(f"已存在 {len(found)} 个音：{names}")
 
     def _developer_page(self) -> QWidget:
-        page, layout = self._page("开发者", "调试用的观察窗口：看模型实际收到了什么，以及程序正在做什么。")
+        page, layout = self._page("开发者", "调试用的观察窗口")
         self.developer_enabled = QCheckBox("启用开发者面板")
         self.developer_enabled.toggled.connect(self._on_developer_toggled)
         layout.addWidget(self.developer_enabled)
         layout.addWidget(
             QLabel(
-                "开启后立即开始记录，并直接弹出面板，不必先保存设置。",
+                "开启后立即开始记录",
                 objectName="hint",
             )
         )
         layout.addSpacing(14)
-        layout.addWidget(self._label("面板里能看到什么"))
+        layout.addWidget(self._label("内容："))
         for line in (
-            "· 每次请求真正发出去的消息：system 只铺一次，其余只追加新增的几条；",
+            "· 每次请求发出消息：system 只铺一次，其余只追加新增的几条；",
             "· 条数与 token 估算、模型与温度、首字延迟与总耗时、是否被打断；",
             "· 模型的深度思考收在可折叠的区块里，推理期间实时长出来；",
             "· 技能调用：模型要查什么、参数是什么、本地跑了多久、拿回什么；",
@@ -624,9 +614,6 @@ class SettingsWindow(QMainWindow):
         self.developer_open.setEnabled(False)
         self.developer_open.clicked.connect(self._open_dev_window)
         layout.addWidget(self.developer_open, alignment=Qt.AlignLeft)
-        layout.addWidget(
-            QLabel("记录只放在内存里、不写文件（上限 500 条），关掉开关即清空。", objectName="hint")
-        )
         layout.addStretch()
         return page
 
@@ -839,7 +826,7 @@ class SettingsWindow(QMainWindow):
             return
         self._store_character_fields(self._active_character or "")
         if name in self._registered():
-            StyledDialog.notice(self, "添加角色", f"角色“{name}”已经在列表里了。")
+            StyledDialog.notice(self, "添加角色", "角色已存在，角色名不可用")
             return
         if characters.character_dir(name).is_dir():
             # 之前「断开连接」保留下来的文件夹，直接重新挂上
@@ -948,26 +935,25 @@ class SettingsWindow(QMainWindow):
         self.notes_corner.setChecked(position == "corner")
         self.notes_center.setChecked(position == "center")
         self.notes_pet.setChecked(position not in ("corner", "center"))
-        weather = (self.data.get("skills", {}) or {}).get("weather", {}) or {}
-        self.weather_enabled.setChecked(bool(weather.get("enabled", True)))
+        skills = self.data.get("skills", {}) or {}
+        self.skills_enabled.setChecked(bool(skills.get("enabled", True)))
+        weather = skills.get("weather", {}) or {}
         self.weather_city.setText(str(weather.get("city", "")))
-        self._on_weather_toggled(self.weather_enabled.isChecked())
-        singing = (self.data.get("skills", {}) or {}).get("sing", {}) or {}
-        self.sing_enabled.setChecked(bool(singing.get("enabled", True)))
+        playing = skills.get("play", {}) or {}
         try:
-            interval = int(singing.get("interval_ms", DEFAULT_INTERVAL_MS))
+            interval = int(playing.get("interval_ms", DEFAULT_INTERVAL_MS))
         except (TypeError, ValueError):
             interval = DEFAULT_INTERVAL_MS
-        self.sing_interval.setValue(interval)
-        self._on_sing_interval_changed(self.sing_interval.value())
+        self.play_interval.setValue(interval)
+        self._on_play_interval_changed(self.play_interval.value())
         try:
-            volume = int(singing.get("volume", 100))
+            volume = int(playing.get("volume", 100))
         except (TypeError, ValueError):
             volume = 100
-        self.sing_volume.setValue(max(0, min(100, volume)))
-        self._on_sing_volume_changed(self.sing_volume.value())
-        self._on_sing_toggled(self.sing_enabled.isChecked())
-        self._refresh_sing_files()
+        self.play_volume.setValue(max(0, min(100, volume)))
+        self._on_play_volume_changed(self.play_volume.value())
+        self._on_skills_toggled(self.skills_enabled.isChecked())
+        self._refresh_play_files()
         # 开发者开关：这里只同步界面，真正开启由 PetWindow 按同样的设置执行，
         # 免得"启动时看到开关是开的"就顺手把面板弹出来
         enabled = bool(self.data.get("developer", {}).get("enabled", False))
@@ -1002,14 +988,11 @@ class SettingsWindow(QMainWindow):
             ),
         })
         self.data["skills"] = {
-            "weather": {
-                "enabled": self.weather_enabled.isChecked(),
-                "city": self.weather_city.text().strip(),
-            },
-            "sing": {
-                "enabled": self.sing_enabled.isChecked(),
-                "interval_ms": self.sing_interval.value(),
-                "volume": self.sing_volume.value(),
+            "enabled": self.skills_enabled.isChecked(),
+            "weather": {"city": self.weather_city.text().strip()},
+            "play": {
+                "interval_ms": self.play_interval.value(),
+                "volume": self.play_volume.value(),
             },
         }
         self.data.setdefault("developer", {})["enabled"] = self.developer_enabled.isChecked()

@@ -64,14 +64,19 @@ class ToolRegistry:
         skill = self._skills.get(name)
         return skill.label if skill is not None else name
 
-    def run(self, name: str, arguments: dict[str, Any]) -> str:
-        """执行一个技能；任何异常都变成可读的失败说明，绝不让它逃进请求线程。"""
+    def run(self, name: str, arguments: dict[str, Any]) -> tuple[bool, str]:
+        """执行一个技能，返回 ``(有没有跑通, 给模型看的文本)``。
+
+        "跑通"只表示这次执行没抛异常——技能自己返回的"查不到 / 演奏不了"这类业务性结果
+        仍算跑通，那是它要讲给模型听的内容。异常一律接住并变成可读说明，绝不让它逃进
+        请求线程；带上这个标记是为了让上层能明确告诉模型"这次调用到底成没成"。
+        """
         skill = self._skills.get(name)
         if skill is None:
             devtools.log.warning("技能 · 模型调用了不存在的工具：%s", name)
-            return f"没有名为 {name} 的工具，请只用已提供的工具。"
+            return False, f"没有名为 {name} 的工具，请只用已提供的工具。"
         try:
-            return str(skill.run(arguments or {}))
+            return True, str(skill.run(arguments or {}))
         except Exception as exc:  # noqa: BLE001 - 技能出错不该拖垮这一轮对话
             devtools.log.warning("技能 · %s 执行失败：%s", name, exc, exc_info=True)
-            return f"{name} 执行失败：{exc}"
+            return False, f"{name} 执行失败：{exc}"

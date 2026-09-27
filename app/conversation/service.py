@@ -39,26 +39,20 @@ from app.skills.base import ToolRegistry
 DEFAULT_LIMIT = 20
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TIMEOUT = 60
-#: 各事件的冷却秒数（没列出的事件不冷却，来了就发）。
-#: 只拦会反复触发的：拖动每次松手都可能算一次，记事板每敲几下就写一次——每个事件都是
-#: 一次真实请求，不拦一下会烧掉大量调用。番茄钟与动作模式是明确的单次动作，冷却反而会
-#: 让"开始专注 → 十分钟后暂停"这种前后关系断掉。
+#: 各事件的冷却秒数，拦截可能会频繁触发的功能
 EVENT_COOLDOWN = {"拖动": 20, "记事板": 10}
 
-#: 配置类问题（没填 API、Key / 地址 / 模型名不对）在界面上的统一说法。
-#: 具体报错（401 原文、连接失败原因）仍然进开发者面板与运行日志——把
-#: "401 鉴权失败，请检查环境变量里的 API Key：Authentication Fails" 甩给用户，
-#: 除了劝退没别的用。
+#: 配置类问题（没填 API、Key / 地址 / 模型名不对）界面显示
 CONFIG_ERROR_TEXT = "该功能需要检查api配置！"
-
-#: 「测试连接」里的说法。那里本来就是"检查配置"的地方，把 401 原文摆出来没有意义，
-#: 所以配置类失败（没填地址 / Key、401/403/404）统统换成这一句。
 CONFIG_CHECK_TEXT = "请检查api配置！"
 
 #: 一轮对话里最多允许几轮"模型要工具 → 本地执行 → 结果回填"。
-#: 查一次天气 = 1 轮；3 轮足够应付"先问城市再查"这种两步，又不至于让模型无限查下去。
-#: 用完轮数后请求不再带 ``tools``，模型只能拿查到的信息作答。
 MAX_TOOL_ROUNDS = 3
+
+
+def tool_result_text(name: str, ok: bool, result: str) -> str:
+    """把技能结果反馈"""
+    return f"[工具调用结果] {name}：{'调用成功' if ok else '调用失败'}\n{result}"
 
 
 def _as_float(value: Any, fallback: float) -> float:
@@ -85,11 +79,7 @@ def build_provider(info: dict) -> LLMProvider | None:
 
 
 def check_connection(info: dict) -> tuple[bool, str]:
-    """「测试连接」用：发一条极短请求，把报错直接翻译成可读文案。
-
-    配置类失败一律说 :data:`CONFIG_CHECK_TEXT`——用户点这个按钮就是在检查配置，
-    401 原文（"Authentication Fails"）摆在这里只会让人以为是网络问题。
-    """
+    """测试连接"""
     if not str(info.get("base_url", "")).strip():
         return False, CONFIG_CHECK_TEXT
     if not str(info.get("model", "")).strip():
@@ -108,8 +98,7 @@ def check_connection(info: dict) -> tuple[bool, str]:
     return True, f"连接成功，模型 {model} 可用"
 
 
-#: 推理内容转发给开发者面板的节奏：攒够这么多字符、或距上次超过这么久，就发一次。
-#: 推理动辄上千个片段，逐个发会淹掉主线程——面板那边也刷不过来。
+#: 推理内容转发给开发者面板的频率
 REASONING_FLUSH_CHARS = 120
 REASONING_FLUSH_SECONDS = 0.2
 
@@ -244,12 +233,7 @@ class _StreamWorker(QThread):
         return "".join(parts), calls
 
     def _run_tools(self, calls: list[ToolCall], text: str = "") -> None:
-        """执行模型这一轮要的工具：把调用与结果都写回上下文，并攒一份给上层落盘。
-
-        调用与结果**成对**攒进 :attr:`tool_exchange`：万一中途被打断，落进历史的助手
-        消息里绝不能只有 ``tool_calls`` 而没有对应的 ``tool`` 结果——那种上下文不合法，
-        以后每次发请求都会被接口拒掉。
-        """
+        """执行工具：把调用与结果都写回上下文"""
         api_calls = [
             {
                 "id": call.id,
@@ -273,16 +257,20 @@ class _StreamWorker(QThread):
             # 面板先摆一块"执行中…"：联网那几秒不长，但看得见比看不见好
             devtools.preview("tool", name=call.name, arguments=call.arguments or {})
             started = time.monotonic()
-            result = self._registry.run(call.name, call.arguments or {})
+            ok, result = self._registry.run(call.name, call.arguments or {})
             devtools.record(
                 "tool",
                 name=call.name,
                 arguments=call.arguments or {},
                 result=result,
+                ok=ok,
                 seconds=round(time.monotonic() - started, 2),
             )
-            self._messages.append({"role": ROLE_TOOL, "tool_call_id": call.id, "content": result})
-            results.append({"id": call.id, "name": call.name, "result": result})
+            # 回填的是带抬头的反馈文本：模型据此明确知道这次调用成没成
+            self._messages.append(
+                {"role": ROLE_TOOL, "tool_call_id": call.id, "content": tool_result_text(call.name, ok, result)}
+            )
+            results.append({"id": call.id, "name": call.name, "result": result, "ok": ok})
             self.tool_runs += 1
         if len(results) == len(api_calls):
             self.tool_exchange.append({"calls": api_calls, "results": results, "text": text})
@@ -302,7 +290,7 @@ class ConsolidationWorker(QThread):
     def run(self) -> None:
         provider = build_provider(self._info)
         if provider is None:
-            self.failed.emit("没有配置 API 地址或模型名称，无法整理记忆")
+            self.failed.emit("无法整理记忆，请检查API地址或模型名称配置")
             return
         try:
             added, merged = consolidate_pending(self._store, provider)
@@ -444,9 +432,9 @@ class ConversationService(QObject):
         self._consolidator = None
 
     def set_prefix_provider(self, provider: Callable[[], str] | None) -> None:
-        """挂一个"这条用户消息要不要带动作前缀"的供应器（由界面提供，如唱歌被打断）。
+        """挂一个"这条用户消息要不要带动作前缀"的供应器（由界面提供，如演奏被打断）。
 
-        服务层不关心唱歌这回事，只负责把取回来的那一行塞进消息最前面（见
+        服务层不关心演奏这回事，只负责把取回来的那一行塞进消息最前面（见
         :attr:`Message.prefix`）：所以两条发送入口（聊天窗、漂浮输入框）都不必各自处理。
         """
         self._prefix_provider = provider
@@ -660,8 +648,16 @@ class ConversationService(QObject):
                     )
                 )
                 for item in tool_round["results"]:
+                    # 存的是**同一份**带抬头的反馈文本：模型这一轮看到什么，之后每一轮
+                    # 从历史里看到的就该是什么，不然它会觉得"我明明调用过，怎么没记录"
                     self._memory.append(
-                        Message(role=ROLE_TOOL, content=item["result"], tool_call_id=item["id"])
+                        Message(
+                            role=ROLE_TOOL,
+                            content=tool_result_text(
+                                str(item.get("name") or ""), bool(item.get("ok", True)), str(item["result"])
+                            ),
+                            tool_call_id=item["id"],
+                        )
                     )
         if self._memory is not None and (text or interrupted or silent):
             self._memory.append(

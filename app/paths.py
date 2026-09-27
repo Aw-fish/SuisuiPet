@@ -9,8 +9,6 @@ import sys
 from pathlib import Path
 
 if getattr(sys, "frozen", False):
-    # 打包后（PyInstaller）：源码被塞进包内部，按它的位置找 data/ 会落进 _internal。
-    # 这里改成认 exe 所在的目录，data/ 就摆在程序旁边，用户能自己换立绘、改配置。
     ROOT_DIR = Path(sys.executable).resolve().parent
 else:
     ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -27,5 +25,5 @@ ICON_PNG_PATH = DATA_DIR / "icon.png"
 DEVTOOLS_LOG_PATH = DATA_DIR / "devtools.log"
 #: 记事板内容（纯文本，本地文件，不进版本控制）
 NOTES_PATH = DATA_DIR / "notes.md"
-#: 唱歌技能的音效目录（用户自己放 1.mp3 ~ 8.mp3，见目录里的说明文件）
+#: 演奏技能的音效目录（用户自己放 1.mp3 ~ 8.mp3，见目录里的说明文件）
 AUDIO_DIR = DATA_DIR / "audio"

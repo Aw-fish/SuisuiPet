@@ -46,7 +46,7 @@ def set_enabled(value: bool) -> None:
 
 
 def clear() -> None:
-    """清空内存记录，并删掉本地日志文件（面板上的「清除缓存」走这里）。"""
+    """清空内存记录，并删掉本地日志文件「清除缓存」"""
     _records.clear()
     try:
         paths.DEVTOOLS_LOG_PATH.unlink(missing_ok=True)
@@ -96,15 +96,12 @@ def stamp() -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略估算 token 数，只用于看量级——不追求与计费口径一致。
-
-    不引入分词器（项目一直保持零新增依赖），用两条经验规则：
+    """粗略估算 token 数
 
     * **非 ASCII 字符按 1 token 计**：常用汉字、中文标点与全角符号在 BPE 里
       基本各自成词，实测对纯中文文本误差在 ±15% 以内；
     * **ASCII 按 4 字符 1 token 计**：英文单词与数字的平均水平。
 
-    所以它适合比较"哪一段更贵"，不适合拿来对账。
     """
     if not text:
         return 0
@@ -114,7 +111,6 @@ def estimate_tokens(text: str) -> int:
 
 
 def record(kind: str, **fields: Any) -> None:
-    """记一条。未开启时直接返回，所以调用方不必到处写 ``if enabled()``。"""
     if not _enabled:
         return
     event: dict[str, Any] = {"kind": kind, "ts": stamp()}
@@ -126,9 +122,7 @@ def record(kind: str, **fields: Any) -> None:
 def preview(kind: str, **fields: Any) -> None:
     """发一条**不记录**的临时事件：描述"正在进行中"的状态。
 
-    和 :func:`record` 的分工：流式内容动辄上百次更新，全塞进历史会把记录挤爆，
-    也没法复原（重开面板时该看到的是最终结果）。所以这里只通知订阅者，收尾时那条
-    :func:`record` 才是权威数据——面板据它重画。
+    和 :func:`record` 的分工：这里只通知订阅者收尾时那条，面板据record重画。
     """
     if not _enabled:
         return

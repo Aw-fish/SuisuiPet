@@ -1,27 +1,4 @@
-"""开发者面板：把模型实收实返的原文摊开看。
-
-画面是**一条连续的流水**（不是一轮一个盒子）：一条时间分隔线，接着这一轮发出去的
-消息，然后是模型返回的原文。灰色小字是"其他信息"（token 估算、耗时、模型参数），
-和正文分开；模型的**深度思考**收在可折叠的区块里：推理期间实时长出来、展开着，
-正文一开始自动收起，收尾后默认收起——点标题随时展开（见 :class:`_Collapse`）。
-
-消息编号 ``[1] [2] …`` 是它在**这次请求的消息数组**里的位置，整段会话连着数，
-不会每轮从头开始。
-
-显示上做三件事：
-
-* **重复的不重印**：只把这一轮新增的消息追加在后面。两次请求之间会滑动上下文窗口
-  （旧的被挤出去），所以不能按位置硬对，而是按内容找"上一轮的结尾 == 这一轮的开头"
-  的最大重叠（见 :func:`_overlap`）；system 每条请求都要重拼（记忆注入随时在变），
-  拿它比对会让后面全部跟着重印，因此单独用一行说明它变了哪几块；
-* **发出去的东西照实显示**：`[当前时间]`、`[被打断]` 这些既然进了请求，就原样在
-  正文里，面板不再另做区分或标注；
-* **按 token 计量**：用 :func:`app.devtools.estimate_tokens` 估算（不引入分词器），
-  所以一律标成"约"，只适合比较哪一段更贵，不能拿来对账。
-
-走的是「事件流」：面板要回答的是"这一轮发了什么、回来了什么、贵在哪一段"，
-按发生顺序铺开最直观，也不会在字段变动时失准。
-"""
+""" 开发者面板 """
 
 from __future__ import annotations
 
@@ -45,33 +22,30 @@ from app import devtools
 from app.conversation.message import NARRATION_TAG
 
 WINDOW_SIZE = (880, 660)
-#: 一段正文最多铺几行（超长的截断显示，避免一轮就把面板刷满）
+#: 过长截断显示
 MAX_BODY_LINES = 60
-#: 日志面板里一条最多铺几行
 MAX_LOG_LINES = 40
-#: 换个"对表"时机（重新挂时间行）时，分隔线上给一句提示，跟 ex.txt 的写法一致
+#: 重新挂时间行
 NARRATION_NOTE = "【距上次需要重新输入当前时间】"
 
-#: 流水里的文字分四种身份，各用各的颜色——"其他信息"一眼能和正文分开
 HEAD = "head"    # 分隔线：这一轮什么时候发出
 META = "meta"    # 其他：token 估算、耗时、模型参数
 LABEL = "label"  # 消息标签：[3] assistant
 BODY = "body"    # 正文：原样照搬的消息与回复
 
-#: 与 app/conversation/message.py 的 ROLE_* 对齐，只用于显示
+#: 与 app/conversation/message.py 的 ROLE_* 对齐
 ROLE_LABELS = {"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"}
 #: 参数里只要这几项变了，就要重新显示一行
 PARAM_KEYS = ("model", "temperature", "context_limit", "character")
 
 
 def _clock(value: str) -> str:
-    """把 ISO 时间压成 HH:MM:SS，面板里看着清爽。"""
+    """把 ISO 时间压成 HH:MM:SS"""
     text = str(value)
     return text[11:19] if len(text) >= 19 else text
 
 
 def _tokens(text: str) -> str:
-    """统一写成"约 N token"——这是估算值，不能当计费口径用。"""
     return f"约 {devtools.estimate_tokens(text)} token"
 
 
@@ -80,7 +54,7 @@ def _content(message: dict) -> str:
 
 
 def _clip(text: str, limit: int = MAX_BODY_LINES) -> str:
-    """超长的正文截断显示，注明原文有多少行。"""
+    """过长的正文截断显示"""
     body = str(text).strip("\n")
     lines = body.splitlines()
     if len(lines) <= limit:
@@ -271,9 +245,11 @@ def reasoning_text(event: dict) -> str:
     return str(event.get("reasoning") or "").strip("\n")
 
 
-def tool_title(name: str, seconds: object = None) -> str:
-    """技能块的标题：``技能调用 · get_weather（0.42s）``。"""
+def tool_title(name: str, seconds: object = None, ok: bool = True) -> str:
+    """技能块的标题：``技能调用 · get_weather（0.42s）``；没跑通就补一个「失败」。"""
     title = f"技能调用 · {name or '未知工具'}"
+    if not ok:
+        title += " · 失败"
     try:
         return f"{title}（{float(seconds):.2f}s）"          # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -601,14 +577,16 @@ class DevWindow(QDialog):
                 f"结果：{_clip(str(event.get('result') or ''), MAX_BODY_LINES * 4)}",
             )
         )
+        name = str(event.get("name") or "")
+        ok = bool(event.get("ok", True))
         fold = self._live_tool
         if fold is None:
             # 没实时流过（重开面板回看）：直接补一块
             self._stream.spacer()
-            fold = self._stream.add_tool(tool_title(str(event.get("name") or ""), event.get("seconds")))
+            fold = self._stream.add_tool(tool_title(name, event.get("seconds"), ok))
         else:
-            # 实时那块是执行前建的，标题里还没有耗时，收尾时补上
-            fold.set_title(tool_title(str(event.get("name") or ""), event.get("seconds")))
+            # 实时那块是执行前建的，标题里还没有耗时与成败，收尾时补上
+            fold.set_title(tool_title(name, event.get("seconds"), ok))
         fold.set_text(text)
         fold.set_open(True)
         self._live_tool = None

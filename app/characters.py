@@ -25,15 +25,10 @@ from app.paths import CHARACTERS_DIR
 
 CONFIG_NAME = "character.json"
 SPRITE_DIRNAME = "sprites"
-#: 内置的默认角色名。刻意与仓库自带的 ``data/characters/default/`` 对齐：
-#: 全新安装（或打包成 demo）时还没有 settings.json，选中的就是这个名字，对不上就会
-#: 明明带着立绘却报"找不到立绘"。
-#: （注意别与下面的 ``DEFAULT_CHARACTER`` 配置模板重名——那是另一回事。）
 DEFAULT_CHARACTER_NAME = "default"
 MEMORY_DIRNAME = "memory"
 
-#: API Key 存在这里，方便本地改动；character.json 已在 .gitignore 中忽略，
-#: 不会随仓库上传
+#: API Key 存在本地；character.json 已在 .gitignore 中忽略
 DEFAULT_CHARACTER: dict[str, Any] = {
     "name": "",
     "format": "img",
@@ -53,22 +48,14 @@ _ILLEGAL_NAME = re.compile(r'[\\/:*?"<>|]')
 
 
 def is_valid_name(name: str) -> bool:
-    """角色名会直接作为文件夹名，需要挡掉非法字符。"""
+    """角色名-文件夹名"""
     name = name.strip()
     if not name or name in {".", ".."}:
         return False
     return _ILLEGAL_NAME.search(name) is None
 
 
-def next_available_name(base: str) -> str:
-    """重名时追加 -2、-3……"""
-    base = base.strip()
-    if not (CHARACTERS_DIR / base).exists():
-        return base
-    index = 2
-    while (CHARACTERS_DIR / f"{base}-{index}").exists():
-        index += 1
-    return f"{base}-{index}"
+
 
 
 def character_dir(name: str) -> Path:
@@ -80,7 +67,7 @@ def config_path(name: str) -> Path:
 
 
 def sprite_dir(name: str, info: dict[str, Any] | None = None) -> Path:
-    """立绘目录：默认是角色目录下的 ``sprites``，``asset`` 支持绝对路径。"""
+    """立绘目录"""
     asset = str((info or {}).get("asset") or "").strip() or SPRITE_DIRNAME
     directory = Path(asset)
     return directory if directory.is_absolute() else character_dir(name) / directory
@@ -144,9 +131,12 @@ def ensure_character(name: str) -> str:
 
 
 def create_character(name: str) -> str:
-    """新建角色，返回实际使用的名字（重名会自动加后缀）。"""
-    real = ensure_character(next_available_name(name.strip()))
-    return real
+    """新建角色并返回角色名。
+
+    重名不再自动加后缀（那样容易悄悄多出好几个角色）：界面先查重，重了就直接提示
+    "角色已存在，角色名不可用"，不会走到这里。
+    """
+    return ensure_character(name.strip())
 
 
 def import_character(source: Path | str) -> str:
@@ -157,7 +147,9 @@ def import_character(source: Path | str) -> str:
     source_config = source / CONFIG_NAME
     if source.resolve() == CHARACTERS_DIR.resolve():
         raise ValueError("请选择具体的角色文件夹，而不是 characters 总目录")
-    real = next_available_name(source.name)
+    real = source.name
+    if character_dir(real).exists():
+        raise ValueError("角色已存在，角色名不可用")
     target = character_dir(real)
     CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)

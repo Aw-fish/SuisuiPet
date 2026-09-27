@@ -1,11 +1,11 @@
-"""唱歌：把简谱数组交给界面，按固定间隔放对应的音效。
+"""演奏：把简谱数组交给界面，按固定间隔放对应的音效。
 
 工具与界面分工明确：
 
 * 本模块（跑在**请求线程**里）只做"翻译与校验"——把 1~8 的音符翻成 ``data/audio``
   里的文件、检查缺什么，然后把播放**交给注入的回调**；
 * 真正的播放是 Qt 的事，必须在 GUI 线程里做，所以回调由界面提供、内部走 Qt 信号
-  （跨线程发信号是安全的，见 ``app/ui/singer.py``）。
+  （跨线程发信号是安全的，见 ``app/ui/player.py``）。
 
 文件名认三种写法（都从 ``data/audio`` 里找）：``1.mp3``、``1_do.mp3``、``do.mp3``；
 高音 do（8）写 ``8`` / ``do2`` / ``do'``。缺哪个音就跳哪个音，并把缺口回报给模型。
@@ -18,13 +18,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app import devtools, paths
-from app.conversation.message import SILENT_MARK
 
 #: 简谱音域：0=空拍（这一拍什么都不播，只占时间）、1=do … 8=高音 do
 MIN_NOTE, MAX_NOTE = 0, 8
 #: 空拍
 REST = 0
-#: 一次最多唱多少拍（太长的旋律听得累，也容易把一轮对话拖很久）
+#: 一次最多演奏多少拍（太长的旋律听得累，也容易把一轮对话拖很久）
 MAX_NOTES = 32
 #: 默认间隔（毫秒）：音效一个约 1 秒，间隔越短越连成旋律。模型没给速度时用设置里的值
 DEFAULT_INTERVAL_MS = 500
@@ -96,7 +95,7 @@ def default_interval_ms() -> int:
     """设置里的默认速度（毫秒），越界夹回 :data:`INTERVAL_RANGE`。"""
     from app.config import load_settings          # 延迟导入：config 与本模块互相被 import
 
-    config = (load_settings().get("skills") or {}).get("sing") or {}
+    config = (load_settings().get("skills") or {}).get("play") or {}
     try:
         value = int(config.get("interval_ms", DEFAULT_INTERVAL_MS))
     except (TypeError, ValueError):
@@ -134,20 +133,17 @@ def clean_notes(value: Any) -> list[int]:
     return notes[:MAX_NOTES]
 
 
-class SingSkill:
-    """唱一段旋律：``notes`` 是 1~8 的音符数组。"""
+class PlaySkill:
+    """演奏一段旋律：``notes`` 是 1~8 的音符数组。"""
 
-    name = "sing"
-    label = "唱歌"
+    name = "play"
+    label = "演奏"
     description = (
-        "唱一段旋律。notes 是音符序列，用简谱数字：1=do、2=re、3=mi、4=fa、5=sol、6=la、"
-        "7=si、8=高音 do、0=空拍。**只在用户明确要求或同意时调用**（“唱首歌”“来一段”这类），"
-        "不要自己主动开口唱；用户没说唱什么时，自己挑一段或即兴编一段直接唱，不要反问要唱哪首。"
-        f"自己按旋律的音高走向编一串音符（8~24 个比较悦耳，最多 {MAX_NOTES} 个），"
-        "并用 0 做停顿换气——一直连着唱会显得很赶。只有这八个音加一个空拍，"
-        "没有升降号，也没有长短音；同一个音重复就是拖长。**播放速度由你定**："
-        "用 interval_ms 给每拍的毫秒数（抒情放慢、欢快加快）。"
-        "**调用它的这一轮不要输出任何文字**——安静地把旋律排出来就行，剩下的交给它去播。"
+        "演奏一段旋律。notes 是音符序列，用简谱数字：1=do、2=re、3=mi、4=fa、5=sol、6=la、"
+        "7=si、8=高音 do、0=空拍。只在用户明确要求演奏或同意时调用，不要自己主动演奏；"
+        f"按旋律的音高走向编一串音符（3个以上，最多 {MAX_NOTES} 个），并用 0 做停顿换气。"
+        "播放速度由你定：用 interval_ms 给每拍的毫秒数。"
+        "这一轮不用说话：这个工具会一直等到曲子放完才把结果交回给你，那时你再回应。"
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -158,7 +154,7 @@ class SingSkill:
                 "description": (
                     "音符序列，每个是 0~8：0=空拍（这一拍什么都不播，只占时间，用来做停顿与"
                     "呼吸）、1=do、2=re、3=mi、4=fa、5=sol、6=la、7=si、8=高音 do。"
-                    "例如《小星星》开头：1 1 5 5 6 6 5"
+                    "例如：1 1 5 5 6 6 5"
                 ),
             },
             "interval_ms": {
@@ -189,26 +185,25 @@ class SingSkill:
         available = audio_paths()
         if not available:
             return (
-                f"现在唱不了：{paths.AUDIO_DIR} 里还没有音效文件。"
-                "（提示用户放 1.mp3 ~ 8.mp3，或 do.mp3 这类唱名命名）"
+                f"现在演奏不了：{paths.AUDIO_DIR} 里还没有音效文件。"
             )
         playable = [note for note in notes if note != REST and note in available]
         missing = sorted({note for note in notes if note != REST and note not in available})
         rests = sum(1 for note in notes if note == REST)
         if not playable:
             if rests:
-                return "整段都是空拍，没什么可唱的：notes 里至少要有一个 1~8 的音。"
+                return "整段都是空拍，没什么可演奏的：notes 里至少要有一个 1~8 的音。"
             return f"这些音都没有对应音效：{missing}（现成的有 {sorted(available)}），换些音再试。"
         if self._player is None:
-            return "现在唱不了：没有可用的播放通道。"
+            return "现在演奏不了：没有可用的播放通道。"
         interval = speed_of(arguments.get("interval_ms"))
         # 缺音效的音就地变成空拍：节拍不断，只是那一拍没出声
         beats = [REST if note == REST or note not in available else note for note in notes]
-        devtools.log.info("技能 · 唱歌 %s（%d 拍、间隔 %dms）", beats, len(beats), interval)
+        devtools.log.info("技能 · 演奏 %s（%d 拍、间隔 %dms）", beats, len(beats), interval)
+        # 这行会等曲子放完才回来（见 PetWindow._request_play），所以它带着"演奏完了"的结论
         detail = self._player(beats, interval)
-        tail = f"；{missing} 没有音效文件，已经换成空拍" if missing else ""
+        note = f"；{missing} 没有音效文件，已经换成空拍" if missing else ""
         return (
-            f"开始唱 {len(beats)} 拍（{len(playable)} 个音、{rests} 个空拍{tail}），"
+            f"开始演奏 {len(beats)} 拍（{len(playable)} 个音、{rests} 个空拍{note}），"
             f"每拍间隔 {interval} 毫秒。{detail}"
-            f"曲子正在播放，这一轮不要说话，直接输出 {SILENT_MARK}。"
         )
