@@ -42,6 +42,13 @@ EVENT_HINT = (
     f"可以顺着它回应一句，也可以不作回应：只输出 {SILENT_MARK}，不输出其他内容"
 )
 
+#: 动作前缀（``Message.prefix``）的说明。只在上下文里真的带了前缀时才注入。
+#: 与上一段的区别：它是挂在**用户这句话前面**的一行，说明"刚刚发生了什么"。
+PREFIX_HINT = (
+    "- 用户消息最前面单独一行、以 [ ] 开头的是刚发生的动作（如 [打断唱歌]：你上一次唱歌被"
+    "这个消息打断了），不是用户说的话本身。可以顺着它回应一句（比如「好，那我不唱了」）"
+)
+
 
 def is_silent(text: str) -> bool:
     """这段回复是不是"明确表示不作回应"。容忍全角 / 半角括号与首尾空白。"""
@@ -74,22 +81,29 @@ class Message:
     #: 事件用 user 角色进请求（模型可以顺着它回应），但界面上不显示——只留给请求、会话
     #: 日志与开发者面板。
     event: bool = False
+    #: 挂在消息最前面的**动作前缀**（如 ``[打断唱歌]``，见 :data:`PREFIX_HINT`）。
+    #: 与旁白同理：只在请求里存在，界面不显示（用户看不到自己那句话被加了什么），
+    #: 但会随会话落盘——翻日志、看开发者面板时能知道当时发生了什么。
+    prefix: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str = ""
 
     def to_api(self) -> dict[str, Any]:
         """转成 OpenAI 兼容接口的 message 格式。
 
-        两处只在**请求里**存在的修饰（落盘与界面都看不到）：
+        三处只在**请求里**存在的修饰（落盘与界面都看不到正文里的这些记号）：
 
         * 被打断的回复在末尾补 ``INTERRUPT_MARK``（模型才知道那是说到一半）；
-        * ``narration`` 作为 ``NARRATION_TAG`` 旁白加在最前面（当前时间这类环境提示）。
+        * ``prefix`` 是刚发生的动作（``[打断唱歌]`` 这类），加在最前面；
+        * ``narration`` 作为 ``NARRATION_TAG`` 旁白加在动作之后（当前时间这类环境提示）。
         """
         content = self.content
         if self.interrupted:
             content = f"{content}{INTERRUPT_MARK}" if content.strip() else INTERRUPT_MARK
         if self.narration:
             content = f"{NARRATION_TAG} {self.narration}\n{content}"
+        if self.prefix:
+            content = f"{self.prefix}\n{content}"
         payload: dict[str, Any] = {"role": self.role, "content": content}
         if self.tool_calls:
             payload["tool_calls"] = self.tool_calls
@@ -102,6 +116,8 @@ class Message:
         record: dict[str, Any] = {"ts": self.ts, "role": self.role, "content": self.content}
         if self.narration:
             record["narration"] = self.narration
+        if self.prefix:
+            record["prefix"] = self.prefix
         if self.interrupted:
             record["interrupted"] = True
         if self.event:
@@ -120,6 +136,7 @@ class Message:
             ts=str(record.get("ts", "")) or now_stamp(),
             interrupted=bool(record.get("interrupted")),
             narration=str(record.get("narration", "")),
+            prefix=str(record.get("prefix", "")),
             event=bool(record.get("event")),
             tool_calls=list(record.get("tool_calls") or []),
             tool_call_id=str(record.get("tool_call_id", "")),

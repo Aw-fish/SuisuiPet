@@ -24,3 +24,7 @@ devlog.md
 # 打包产物：demo/ 是 PyInstaller 的 onedir 输出（百兆级），build/ 是中间产物
 demo/
 build/
+
+# 唱歌技能的音效只随本地走：仓库里保留目录与说明文件（.gitkeep），音频自己放
+data/audio/*
+!data/audio/.gitkeep

@@ -10,9 +10,10 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import QObject, QThread, Signal
 
@@ -24,14 +25,16 @@ from app.conversation.message import (
     SILENT_MARK,
     Message,
     ROLE_ASSISTANT,
+    ROLE_TOOL,
     ROLE_USER,
     is_silent,
     silent_pending,
 )
-from app.conversation.providers.base import LLMProvider, ProviderError
+from app.conversation.providers.base import LLMProvider, ProviderError, ToolCall
 from app.conversation.providers.openai_compat import OpenAICompatProvider
 from app.conversation.sentence import SentenceSplitter
 from app.pet.emotion import EXPRESSION_HINT, TagFilter, mood_asset
+from app.skills.base import ToolRegistry
 
 DEFAULT_LIMIT = 20
 DEFAULT_TEMPERATURE = 0.8
@@ -51,6 +54,11 @@ CONFIG_ERROR_TEXT = "该功能需要检查api配置！"
 #: 「测试连接」里的说法。那里本来就是"检查配置"的地方，把 401 原文摆出来没有意义，
 #: 所以配置类失败（没填地址 / Key、401/403/404）统统换成这一句。
 CONFIG_CHECK_TEXT = "请检查api配置！"
+
+#: 一轮对话里最多允许几轮"模型要工具 → 本地执行 → 结果回填"。
+#: 查一次天气 = 1 轮；3 轮足够应付"先问城市再查"这种两步，又不至于让模型无限查下去。
+#: 用完轮数后请求不再带 ``tools``，模型只能拿查到的信息作答。
+MAX_TOOL_ROUNDS = 3
 
 
 def _as_float(value: Any, fallback: float) -> float:
@@ -116,17 +124,34 @@ class _StreamWorker(QThread):
     reasoning_delta = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
+    #: 要执行某个技能了：带一行给用户看的字（如"查天气"）
+    tool_started = Signal(str)
 
-    def __init__(self, provider: LLMProvider, messages: Sequence[dict], parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        provider: LLMProvider,
+        messages: Sequence[dict],
+        tools: Sequence[dict] | None = None,
+        registry: ToolRegistry | None = None,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self._provider = provider
         self._messages = list(messages)
+        #: 发给模型的工具说明；模型要调用时按注册表执行
+        self._tools = list(tools or ())
+        self._registry = registry if registry is not None else ToolRegistry()
         self._cancel = threading.Event()
         #: 这一轮攒下的推理内容（``reasoning_content``），收尾时交给开发者面板。
         #: 推理片段动辄上千个，不逐个发信号，只在这里累加。
         self.reasoning = ""
         #: 失败原因是"配置没弄好"（Key / 地址 / 模型名）：界面该换成一句人话
         self.config_error = False
+        #: 这一轮真正执行了几个工具。收尾时用它判断该不该回滚历史：只要执行过工具，
+        #: 模型就确实看到并处理了用户的话，哪怕最后没能说出正文也不能撤。
+        self.tool_runs = 0
+        #: 已完成的工具轮次（助手调用 + 结果），收尾时成对落进会话日志
+        self.tool_exchange: list[dict[str, Any]] = []
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -139,8 +164,41 @@ class _StreamWorker(QThread):
     def run(self) -> None:
         parts: list[str] = []
         error = ""
-        reasoning = False
-        speaking = False
+        rounds = 0
+        try:
+            while True:
+                # 轮数用完就不再带工具：模型只能拿已经查到的信息作答，不会无限查下去
+                text, calls = self._stream_once(with_tools=rounds < MAX_TOOL_ROUNDS)
+                if text:
+                    parts.append(text)
+                if self._cancel.is_set() or not calls or rounds >= MAX_TOOL_ROUNDS:
+                    break
+                rounds += 1
+                self._run_tools(calls, text)
+        except ProviderError as exc:
+            error = str(exc)
+            self.config_error = bool(getattr(exc, "config", False))
+        except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
+            error = f"请求出错：{exc}"
+        # 主动打断会把阻塞中的连接掐断，读取随之抛异常——那是预期行为，不是失败。
+        # 这里一律按正常结束交回去，由上层以「被打断」收尾并保留已生成的部分。
+        if self._cancel.is_set():
+            self.finished.emit("".join(parts))
+            return
+        if error:
+            self.failed.emit(error)
+            return
+        self.finished.emit("".join(parts))
+
+    def _stream_once(self, with_tools: bool) -> tuple[str, list[ToolCall]]:
+        """跑一次流式请求：转发增量与推理，返回这一轮的正文与模型想要的工具调用。
+
+        「收尾前把尾巴发出去」也在这里：推理是攒着发的（见 :data:`REASONING_FLUSH_CHARS`），
+        每跑完一次都得补一次，否则最后不满一个窗口的那几句会卡在缓冲里。
+        """
+        parts: list[str] = []
+        calls: list[ToolCall] = []
+        speaking = reasoning = False
         pending: list[str] = []
         last_flush = time.monotonic()
 
@@ -153,7 +211,9 @@ class _StreamWorker(QThread):
             last_flush = time.monotonic()
 
         try:
-            for chunk in self._provider.stream(self._messages, cancel=self._cancel):
+            for chunk in self._provider.stream(
+                self._messages, tools=self._tools if with_tools else None, cancel=self._cancel
+            ):
                 if self._cancel.is_set():
                     break
                 if chunk.reasoning:
@@ -177,22 +237,55 @@ class _StreamWorker(QThread):
                         self.reasoning_changed.emit(False)
                     parts.append(chunk.delta)
                     self.delta.emit(chunk.delta)
-        except ProviderError as exc:
-            error = str(exc)
-            self.config_error = bool(getattr(exc, "config", False))
-        except Exception as exc:  # noqa: BLE001 - 线程边界统一兜住
-            error = f"请求出错：{exc}"
-        # 收尾前把尾巴发出去，免得最后不满一个节流窗口的那几句卡在缓冲里
-        flush_reasoning()
-        # 主动打断会把阻塞中的连接掐断，读取随之抛异常——那是预期行为，不是失败。
-        # 这里一律按正常结束交回去，由上层以「被打断」收尾并保留已生成的部分。
-        if self._cancel.is_set():
-            self.finished.emit("".join(parts))
-            return
-        if error:
-            self.failed.emit(error)
-            return
-        self.finished.emit("".join(parts))
+                if chunk.tool_calls:
+                    calls.extend(chunk.tool_calls)
+        finally:
+            flush_reasoning()
+        return "".join(parts), calls
+
+    def _run_tools(self, calls: list[ToolCall], text: str = "") -> None:
+        """执行模型这一轮要的工具：把调用与结果都写回上下文，并攒一份给上层落盘。
+
+        调用与结果**成对**攒进 :attr:`tool_exchange`：万一中途被打断，落进历史的助手
+        消息里绝不能只有 ``tool_calls`` 而没有对应的 ``tool`` 结果——那种上下文不合法，
+        以后每次发请求都会被接口拒掉。
+        """
+        api_calls = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments or {}, ensure_ascii=False),
+                },
+            }
+            for call in calls
+        ]
+        # text 是模型边说要查、边发起调用的那句话（多数模型这里是空的）
+        self._messages.append({"role": ROLE_ASSISTANT, "content": text, "tool_calls": api_calls})
+        results: list[dict[str, Any]] = []
+        for call in calls:
+            if self._cancel.is_set():
+                devtools.log.info("技能 · 被打断，剩下的工具不再执行")
+                break
+            self.tool_started.emit(self._registry.label_for(call.name))
+            devtools.log.info("技能 · 调用 %s(%s)", call.name, call.arguments)
+            # 面板先摆一块"执行中…"：联网那几秒不长，但看得见比看不见好
+            devtools.preview("tool", name=call.name, arguments=call.arguments or {})
+            started = time.monotonic()
+            result = self._registry.run(call.name, call.arguments or {})
+            devtools.record(
+                "tool",
+                name=call.name,
+                arguments=call.arguments or {},
+                result=result,
+                seconds=round(time.monotonic() - started, 2),
+            )
+            self._messages.append({"role": ROLE_TOOL, "tool_call_id": call.id, "content": result})
+            results.append({"id": call.id, "name": call.name, "result": result})
+            self.tool_runs += 1
+        if len(results) == len(api_calls):
+            self.tool_exchange.append({"calls": api_calls, "results": results, "text": text})
 
 
 class ConsolidationWorker(QThread):
@@ -236,6 +329,8 @@ class ConversationService(QObject):
     mood_changed = Signal(object)
     #: 这一轮模型明确表示"不作回应"（SILENT_MARK）：界面不显示，但历史与日志里留着
     silenced = Signal()
+    #: 模型要执行某个技能了：带一行给用户看的字（如"查天气"），界面拿去显示一句提示
+    tool_started = Signal(str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -254,6 +349,10 @@ class ConversationService(QObject):
         #: 本轮从回复里剥掉了多少个表情标记（只给开发者面板看）
         self._tag_count = 0
         self._auto_expression = False
+        #: 当前可用的技能（按设置组装，见 :func:`app.skills.build_registry`）
+        self._skills = ToolRegistry()
+        #: 发消息前问一句"要不要带动作前缀"（见 :meth:`set_prefix_provider`）
+        self._prefix_provider: Callable[[], str] | None = None
         #: 本次请求的时间基准，用来算首字延迟与总耗时（只给开发者面板看）
         self._started_at: float | None = None
         self._first_delta_at: float | None = None
@@ -266,14 +365,17 @@ class ConversationService(QObject):
 
     # ---- 配置 ---------------------------------------------------------------
 
-    def configure(self, character: str, info: dict, base_prompt: str = "") -> None:
+    def configure(self, character: str, info: dict, base_prompt: str = "", skills: ToolRegistry | None = None) -> None:
         """切换当前角色：换角色同时切换记忆目录。
 
         ``base_prompt`` 是与角色无关的通用说话约束（全局设置），发请求时拼在
-        角色提示词前面。
+        角色提示词前面。``skills`` 是当前可用的技能集合（按设置组装）：关掉的技能
+        不在里面，它的说明连请求都不会发出去——不传就沿用上一次的。
         """
         self._info = dict(info or {})
         self._base_prompt = base_prompt or ""
+        if skills is not None:
+            self._skills = skills
         if character != self._character:
             self._character = character
             self._memory = MemoryStore(character) if character else None
@@ -341,6 +443,24 @@ class ConversationService(QObject):
     def _on_consolidation_finished(self) -> None:
         self._consolidator = None
 
+    def set_prefix_provider(self, provider: Callable[[], str] | None) -> None:
+        """挂一个"这条用户消息要不要带动作前缀"的供应器（由界面提供，如唱歌被打断）。
+
+        服务层不关心唱歌这回事，只负责把取回来的那一行塞进消息最前面（见
+        :attr:`Message.prefix`）：所以两条发送入口（聊天窗、漂浮输入框）都不必各自处理。
+        """
+        self._prefix_provider = provider
+
+    def _take_prefix(self) -> str:
+        """取这一条消息的动作前缀；供应器出问题也不能拖垮发送。"""
+        if self._prefix_provider is None:
+            return ""
+        try:
+            return str(self._prefix_provider() or "").strip()
+        except Exception:  # noqa: BLE001 - 界面侧的供应器不该让消息发不出去
+            devtools.log.warning("对话 · 取动作前缀失败", exc_info=True)
+            return ""
+
     def send(self, text: str) -> None:
         text = text.strip()
         if not text:
@@ -354,7 +474,7 @@ class ConversationService(QObject):
         provider = self._provider()
         if provider is None:
             return
-        self._start(provider, self._memory.append_user(text), query=text)
+        self._start(provider, self._memory.append_user(text, self._take_prefix()), query=text)
 
     def notify_event(self, tag: str, text: str = "") -> bool:
         """把一次用户操作（拖动 / 番茄钟 / 跟随）作为**事件**交给模型，返回是否发出去了。
@@ -428,10 +548,11 @@ class ConversationService(QObject):
             tokens,
         )
         self._splitter.reset()
-        worker = _StreamWorker(provider, messages, self)
+        worker = _StreamWorker(provider, messages, self._skills.definitions(), self._skills, self)
         worker.delta.connect(self._on_delta)
         worker.reasoning_changed.connect(self._on_reasoning_changed)
         worker.reasoning_delta.connect(self._on_reasoning_delta)
+        worker.tool_started.connect(self.tool_started)
         worker.finished.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(worker.deleteLater)
@@ -526,6 +647,22 @@ class ConversationService(QObject):
         silent = not error and not interrupted and is_silent(text)
         if silent:
             text = ""
+        if self._memory is not None and worker is not None and worker.tool_exchange:
+            # 工具轮次也记进会话日志：翻记录时看得见"它查了什么、拿到了什么"。
+            # 但它们**不进后续上下文**（见 build_context 的过滤）：助手侧的 tool_calls
+            # 必须与紧随其后的 tool 结果成对出现，单独留下一条就不合法了。
+            for tool_round in worker.tool_exchange:
+                self._memory.append(
+                    Message(
+                        role=ROLE_ASSISTANT,
+                        content=str(tool_round.get("text") or ""),
+                        tool_calls=list(tool_round["calls"]),
+                    )
+                )
+                for item in tool_round["results"]:
+                    self._memory.append(
+                        Message(role=ROLE_TOOL, content=item["result"], tool_call_id=item["id"])
+                    )
         if self._memory is not None and (text or interrupted or silent):
             self._memory.append(
                 Message(
@@ -534,7 +671,15 @@ class ConversationService(QObject):
                     interrupted=interrupted,
                 )
             )
-        if error and not text and not interrupted and self._memory is not None and self._round_message is not None:
+        if (
+            error
+            and not text
+            and not interrupted
+            # 执行过工具就说明模型已经看到并处理了这条消息（哪怕最后一句没说出来），不能撤
+            and not (worker is not None and worker.tool_runs)
+            and self._memory is not None
+            and self._round_message is not None
+        ):
             # 请求失败且一个字都没产出：模型压根没看到这条消息（Key 不对、连不上），
             # 那就撤回刚写进历史的那一条——否则以后整理记忆时，会把"没人回应的话"
             # 当成用户确实说过的事记下来。

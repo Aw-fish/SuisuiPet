@@ -19,6 +19,9 @@ from app.pet.character_sprite import CharacterAssets
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
 from app.ui.dialogs import StyledDialog
 from app.ui.menus import styled_menu
+from app.skills import build_registry
+from app.skills.sing import audio_paths
+from app.ui.singer import Singer
 from app.ui.notes_window import NOTES_OPACITY_DEFAULT, NotesWindow
 
 #: 立绘在桌面上的显示高度（像素）
@@ -88,6 +91,12 @@ FOLLOW_MARGIN = 36
 #: 它们只是"我知道了"，是原来时长的一半，不必一直挡在那；要看清的（任务完成）在调用处
 #: 显式给更长的值。
 SAY_MS = 1150
+
+#: 技能执行（如查天气）时那句提示的停留时长：本地联网要几秒，给足时间
+TOOL_SAY_MS = 6000
+
+#: 唱歌被新消息打断时，挂在这条消息最前面的动作标记（属于"动作"，见 message.PREFIX_HINT）
+INTERRUPT_SING_MARK = "[打断唱歌]"
 
 #: 重新声明「我是置顶窗口」的间隔（毫秒）。别的程序抢 z 序、或全屏程序来回切换之后，
 #: 置顶属性可能被顶掉，桌宠就沉到别人窗口后面去了——"操作一阵子就被盖住"就是这么来的。
@@ -782,6 +791,9 @@ class PetCanvas(QWidget):
 
 
 class PetWindow(QWidget):
+    #: 技能要唱歌：请求线程发出来，队列到 GUI 线程再真正播放
+    sing_requested = Signal(list, int)
+
     def __init__(self, open_settings: Callable[[], None], refresh_settings: Callable[[dict], None], notify: Callable[[str, str], None] | None = None) -> None:
         super().__init__(); self.open_settings = open_settings; self.refresh_settings = refresh_settings; self.notify = notify; self.drag: QPoint | None = None; self._drag_direction = DragDirection(); self.remaining = 0; self._pomodoro_total = 0; self.following = False; self._think_until = 0.0; self._menu_open = False; self._reply_form = FORM_WINDOW; self._speech_buffer = ''; self._speech_shown = ''; self._drag_origin = QPoint(0, 0); self._config_error = False; self.assets: CharacterAssets | None = None; self.sprite_size = DEFAULT_CANVAS_SIZE; self.activity = ACTIVITY_DEFAULT; self.pinned_expression: str | None = None; self._expression_menu: QMenu | None = None; self._art_warned: str | None = None; self._auto_expression = True; self._reasoning = False; self._mood_state: str | None = None; self._mood_changed_at = -10 ** 9; self._mood_dwell_ms, self._mood_timeout_ms = mood_timing(DEFAULT_SENSITIVITY)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint); self.setAttribute(Qt.WA_TranslucentBackground)
@@ -791,6 +803,15 @@ class PetWindow(QWidget):
         self.conversation = ConversationService(self); self.conversation.busy_changed.connect(self._on_conversation_busy); self.conversation.reasoning_changed.connect(self._on_reasoning_changed)
         self.conversation.consolidated.connect(self._on_consolidated)
         self.conversation.mood_changed.connect(self._on_mood_changed)
+        # 模型要执行技能了（如查天气）：气泡里说一声，免得本地联网那几秒毫无动静
+        self.conversation.tool_started.connect(self._on_tool_started)
+        # 唱歌：技能在请求线程里提出，这里在 GUI 线程排期播放
+        self._singing = False
+        self._singer = Singer(self)
+        self._singer.finished.connect(self._on_sing_finished)
+        self.sing_requested.connect(self._on_sing_requested)
+        # 发消息前服务会问一句"要不要带动作前缀"：唱歌被打断就靠它说明
+        self.conversation.set_prefix_provider(self._take_sing_prefix)
         # 对白气泡形式下，回复也往角色上方那个小窗口里流一份（聊天窗口照旧记录，两者同一段会话）
         self.conversation.delta.connect(self._on_reply_delta)
         self.conversation.finished.connect(self._on_reply_finished)
@@ -830,7 +851,11 @@ class PetWindow(QWidget):
         )
         # 开发者面板的开关跟随设置（启动、换角色、保存设置都会走到这里）
         devtools.set_enabled(bool(data.get("developer", {}).get("enabled", False)))
-        self.conversation.configure(name, info, data.get("conversation", {}).get("base_prompt", ""))
+        self.conversation.configure(
+            name, info, data.get("conversation", {}).get("base_prompt", ""),
+            build_registry(data, sing=self._request_sing),
+        )
+        self._singer.set_volume(int((data.get("skills", {}).get("sing") or {}).get("volume", 100)))
         self.chat.set_title(name)
         self.chat.load_history(self.conversation.history(HISTORY_LIMIT))
         # 对话形式与对白透明度跟随设置（启动、换角色、保存设置都会走到这里）
@@ -838,7 +863,8 @@ class PetWindow(QWidget):
         self.speech.set_opacity(int(data.get('conversation', {}).get('bubble_opacity', SPEECH_OPACITY_DEFAULT)))
         self.notes.set_opacity(int(data.get('tools', {}).get('notes_opacity', NOTES_OPACITY_DEFAULT)))
     def _on_conversation_busy(self, busy: bool) -> None:
-        # 刚发出消息、还一个分片都没到的时候，先按"思考"处理
+        # 刚发出消息、还一个分片都没到的时候，先按"思考"处理。
+        # （唱歌被打断是在发送前处理的，见 _take_sing_prefix：按需求只有"新对话"才掐歌）
         if busy: self._reasoning = True; self.canvas.set_state('Think'); self.animation.stop()
         else: self._reasoning = False; self._restore_state()
     def _on_reasoning_changed(self, reasoning: bool) -> None:
@@ -859,11 +885,50 @@ class PetWindow(QWidget):
         self.conversation.reset_memory(); self.chat.load_history([]); self.speech.dismiss(); self.say('记忆已清空')
     def _on_consolidated(self, added: int, merged: int) -> None:
         if added > 0: self.say(f'记忆已整理，新增 {added} 条')
+    def _on_tool_started(self, label: str) -> None:
+        """技能执行期间的那句提示（"正在查天气…"）。联网要几秒，没提示会显得卡住了。"""
+        self.say(f'正在{label}…', TOOL_SAY_MS)
+    def _request_sing(self, notes: list[int], interval_ms: int) -> str:
+        """唱歌技能要用的播放回调——**它是在请求线程里被调用的**。
+
+        所以这里只发信号：跨线程发 Qt 信号是安全的（会队列到 GUI 线程执行），而在这里
+        碰任何界面控件都不是（详见 dev_window 里那个"面板看不到技能块"的教训）。
+        真正的播放见 :meth:`_on_sing_requested`。
+        """
+        self.sing_requested.emit([int(note) for note in notes], int(interval_ms))
+        return f'每个音间隔 {int(interval_ms)} 毫秒。'
+    def _on_sing_requested(self, notes: list[int], interval_ms: int) -> None:
+        """真正开始唱（GUI 线程）：0 是空拍，其余按顺序交给播放器；唱的这段宠物站着。"""
+        available = audio_paths()
+        beats = [available.get(note) if note else None for note in notes]
+        if not any(beats): return
+        count = self._singer.play(beats, interval_ms)
+        if not count: return
+        # 播放器已经排上了，这时才改自己的状态：play() 会先停掉上一次，而 stop() 会发 finished
+        self._singing = True
+        self.animation.stop(); self.canvas.set_state('Talk')
+        # 这里不用 say()：它配的是"思考"动作，唱歌该是说话的样子。气泡自己摆一下
+        self.bubble.setText('正在唱歌…'); self.bubble.show()
+        QTimer.singleShot(max(TOOL_SAY_MS, interval_ms * count + 600), self.bubble.hide)
+    def _on_sing_finished(self) -> None:
+        if not self._singing: return
+        self._singing = False
+        # 正在推理/说话的时候，动作归对话链路管，别抢
+        if not self._reasoning: self._restore_state()
+    def _take_sing_prefix(self) -> str:
+        """发消息前的动作前缀：正在唱歌就停下，并说明"上一支曲子被打断了"。
+
+        服务层是在**发消息之前**问这一句的，所以这里停得掉、也来得及把标记挂上去。
+        标记只在请求与会话日志里（界面看不到），模型据此知道刚才发生了什么。
+        """
+        if not (self._singing or self._singer.playing): return ""
+        self._singer.stop()
+        return INTERRUPT_SING_MARK
     def show_pet(self) -> None:
         """入口调用：有立绘就显示窗口，没有则隐藏并提示一次。"""
         if self.assets is not None:
             self._art_warned = None; self.show(); return
-        self.hide(); self.speech.dismiss(); self.input_box.hide(); self.notes.hide()
+        self.hide(); self.speech.dismiss(); self.input_box.hide(); self.notes.hide(); self._singer.stop()
         name, info = current_character(load_settings())
         folder = characters.sprite_dir(name, info) if name else None
         fingerprint = f"{name}|{folder}"
@@ -1043,6 +1108,8 @@ class PetWindow(QWidget):
         if not self.following or self.drag or self.pinned_expression is not None: return
         # 番茄钟开着不动：专注期间不该跟着光标满桌跑（跟随机游走一个道理）
         if self.pomodoro_active: return
+        # 唱歌期间站着唱（跟番茄钟一个道理）
+        if self._singing: return
         # 思考动作期间不动（跟随机游走一个道理）
         if self._thinking(): return
         if self.animation.state()==QPropertyAnimation.State.Running: return
@@ -1219,6 +1286,8 @@ class PetWindow(QWidget):
         if self.pinned_expression is not None or load_settings()['motion']['mode']!='movable' or self.drag: return
         # 番茄钟开着就老实待着：这段是"专注"时间，不该满桌乱走
         if self.pomodoro_active: return
+        # 唱歌期间站着唱，别一边走一边唱
+        if self._singing: return
         # 思考动作期间不随机移动：一走路，思考动作就被 Move 素材盖住了
         if self._thinking(): return
         _, chance, distance = motion_profile(self.activity)

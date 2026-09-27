@@ -52,6 +52,23 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         #: 记事板每次打开的落点：``pet`` 角色旁 / ``corner`` 右下角 / ``center`` 屏幕中间
         "notes_position": "pet",
     },
+    #: Agent 技能：模型可以自主调用的工具（见 app/skills/）。
+    #: 关掉的技能不进注册表——它的说明连请求都不会发出去，模型自然无从调用
+    "skills": {
+        "weather": {
+            "enabled": True,
+            #: 默认城市：用户没明说时用它；留空则由模型自己去问用户。
+            #: 用户说过的城市会作为事实进长期记忆，模型能从上下文里看到并覆写这里
+            "city": "",
+        },
+        "sing": {
+            "enabled": True,
+            #: 每个音之间的间隔（毫秒）。音效长约 1 秒，间隔越短越连成旋律
+            "interval_ms": 500,
+            #: 播放音量（0~100）
+            "volume": 100,
+        },
+    },
     #: 开发者面板：只看内存里的观察记录，不写文件（见 app/devtools.py）
     "developer": {"enabled": False},
 }

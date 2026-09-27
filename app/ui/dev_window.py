@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -262,6 +262,7 @@ def format_event(
             (HEAD, f"━━━ {when} " + "━" * 14),
             (META, f"· 记忆整理 · 新增 {event.get('added')} 条 · 合并 {event.get('merged')} 条"),
         ]
+
     return [(META, f"[{when}] {kind} {event}")]
 
 
@@ -270,26 +271,45 @@ def reasoning_text(event: dict) -> str:
     return str(event.get("reasoning") or "").strip("\n")
 
 
+def tool_title(name: str, seconds: object = None) -> str:
+    """技能块的标题：``技能调用 · get_weather（0.42s）``。"""
+    title = f"技能调用 · {name or '未知工具'}"
+    try:
+        return f"{title}（{float(seconds):.2f}s）"          # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return title
+
+
+def _arguments_text(arguments: object) -> str:
+    """参数照原样摊开：模型给了什么就写什么，``city=上海`` 比整个 dict 好读。"""
+    if isinstance(arguments, dict) and arguments:
+        return "、".join(f"{key}={value}" for key, value in arguments.items())
+    return str(arguments) if arguments else "（无）"
+
+
 class _Collapse(QWidget):
     """可折叠区块：标题一行，点一下展开内容。
 
     深度思考是**边想边长**的，所以正文要能增量追加（见 :meth:`append`），标题里的
     token 估算跟着刷新。默认收起；推理进行中由面板展开，正文一开始再收回去。
+
+    ``tone`` 决定配色：``think`` 是深度思考（紫），``tool`` 是技能调用（绿）——
+    两件事混在同一种颜色里，翻记录时要多看一眼才知道刚才那行是什么。
     """
 
-    def __init__(self, title: str, text: str = "", parent: QWidget | None = None) -> None:
+    def __init__(self, title: str, text: str = "", tone: str = "think", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._title = title
         self._open = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(3)
-        self.toggle = QToolButton(objectName="fold")
+        self.toggle = QToolButton(objectName="fold" if tone == "think" else "foldTool")
         self.toggle.setCheckable(True)
         self.toggle.setCursor(Qt.PointingHandCursor)
         self.toggle.toggled.connect(self._on_toggled)
         layout.addWidget(self.toggle, 0, Qt.AlignLeft)
-        self.body = QLabel(objectName="quote")
+        self.body = QLabel(objectName="quote" if tone == "think" else "quoteTool")
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.PlainText)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -311,6 +331,11 @@ class _Collapse(QWidget):
 
     def set_text(self, text: str) -> None:
         self.body.setText(_clip(text, MAX_BODY_LINES * 4))
+        self._refresh()
+
+    def set_title(self, title: str) -> None:
+        """换标题（技能块收尾时才拿得到耗时，标题得跟着变一次）。"""
+        self._title = title
         self._refresh()
 
     def set_open(self, opened: bool) -> None:
@@ -363,6 +388,12 @@ class _Stream(QFrame):
         self._layout.addWidget(fold)
         return fold
 
+    def add_tool(self, title: str, text: str = "") -> _Collapse:
+        """技能调用的折叠块：与深度思考同款控件，换一套配色。"""
+        fold = _Collapse(title, text, tone="tool")
+        self._layout.addWidget(fold)
+        return fold
+
     def clear(self) -> None:
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -376,6 +407,9 @@ class _Stream(QFrame):
 class DevWindow(QDialog):
     """开发者面板窗口（从「设置 → 开发者」打开）。"""
 
+    #: devtools 的通知可能在请求线程里发出来：用它把事件转回 GUI 线程再动界面
+    event_received = Signal(dict)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._drag: QPoint | None = None
@@ -385,6 +419,8 @@ class DevWindow(QDialog):
         self._last_context: dict | None = None
         #: 这一轮正在长的深度思考块（实时预览用；收尾那条记录才是权威数据）
         self._live_fold: _Collapse | None = None
+        #: 当前正在执行的技能块（同理由：预览先建、收尾记录再把参数与结果盖上去）
+        self._live_tool: _Collapse | None = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setModal(False)
@@ -437,6 +473,8 @@ class DevWindow(QDialog):
         layout.addWidget(splitter, 1)
 
         self.setStyleSheet(_QSS)
+        # 队列连接：订阅回调跑在哪个线程，界面更新就一定回到 GUI 线程
+        self.event_received.connect(self._handle_event, Qt.QueuedConnection)
         devtools.subscribe(self._on_event)
         self._reload()
 
@@ -488,6 +526,15 @@ class DevWindow(QDialog):
         self._follow_bottom()
 
     def _on_event(self, event: dict) -> None:
+        """devtools 的订阅回调——**它可能在请求线程里被调用**（流式预览、技能记录都是）。
+
+        Qt 的控件只能在自己的线程里创建和修改，所以在回调里直接动界面会被丢掉：以前
+        深度思考能显示，是因为它的权威记录来自主线程的收尾；而技能调用在请求线程里建块，
+        面板上就什么都看不到。这里只把事件转成信号发出去，界面更新交给 GUI 线程。
+        """
+        self.event_received.emit(event)
+
+    def _handle_event(self, event: dict) -> None:
         kind = event.get("kind")
         if kind == "clear":
             self._clear_views()
@@ -507,6 +554,9 @@ class DevWindow(QDialog):
         elif kind == "reasoning_done" and self._live_fold is not None:
             # 正文开始了：把深度思考收回来（跟主流 AI 前端一个做法）
             self._live_fold.set_open(False)
+        elif kind == "tool":
+            self._live_tool_block(str(event.get("name") or ""), event.get("arguments"))
+            self._follow_bottom()
 
     def _live_reasoning(self) -> _Collapse | None:
         """当前这轮的深度思考块：第一次用到时现建，并展开着让内容长出来。"""
@@ -530,6 +580,39 @@ class DevWindow(QDialog):
             self._live_fold.set_text(reasoning)
         self._live_fold.set_open(False)
 
+    def _live_tool_block(self, name: str, arguments: object) -> _Collapse:
+        """模型要执行技能了：先建一个"执行中…"的块，联网那几秒不至于空着。
+
+        与深度思考同一套分工：预览只影响流水末尾，收尾那条 ``tool`` 记录才是权威数据。
+        每次调用单独一块——一轮里连查两个城市时，两块分开看得清楚。
+        """
+        if self._live_tool is None:
+            self._stream.spacer()
+            self._live_tool = self._stream.add_tool(tool_title(name))
+            self._live_tool.set_open(True)
+            self._live_tool.set_text(f"参数：{_arguments_text(arguments)}\n执行中…")
+        return self._live_tool
+
+    def _finish_tool(self, event: dict) -> None:
+        """收尾：把参数与结果盖到块上。刚发生的这次默认展开——参数和结果就是来看它的。"""
+        text = "\n".join(
+            (
+                f"参数：{_arguments_text(event.get('arguments'))}",
+                f"结果：{_clip(str(event.get('result') or ''), MAX_BODY_LINES * 4)}",
+            )
+        )
+        fold = self._live_tool
+        if fold is None:
+            # 没实时流过（重开面板回看）：直接补一块
+            self._stream.spacer()
+            fold = self._stream.add_tool(tool_title(str(event.get("name") or ""), event.get("seconds")))
+        else:
+            # 实时那块是执行前建的，标题里还没有耗时，收尾时补上
+            fold.set_title(tool_title(str(event.get("name") or ""), event.get("seconds")))
+        fold.set_text(text)
+        fold.set_open(True)
+        self._live_tool = None
+
     def _show(self, event: dict) -> None:
         kind = event.get("kind")
         if kind == "clear":
@@ -540,6 +623,13 @@ class DevWindow(QDialog):
         if kind == "request":
             self._stream.new_turn()
             self._live_fold = None
+            self._live_tool = None
+        if kind == "tool":
+            # 技能调用单独一块（与深度思考同款折叠控件、另一套配色），不走纯文本那条路
+            self._finish_tool(event)
+            self._update_stats()
+            self._follow_bottom()
+            return
         if kind == "reply":
             self._stream.spacer()
             self._finish_reasoning(event)
@@ -576,6 +666,7 @@ class DevWindow(QDialog):
         self._last_request = None
         self._last_context = None
         self._live_fold = None
+        self._live_tool = None
         self._update_stats()
 
     def _clear_views(self) -> None:
@@ -627,6 +718,12 @@ QLabel#quote {
 }
 QToolButton#fold { border:0; background:transparent; color:#7C6FC4; font:600 10px "Microsoft YaHei UI"; padding:1px 0; }
 QToolButton#fold:hover { color:#5B4BA8; }
+QToolButton#foldTool { border:0; background:transparent; color:#2E8B76; font:600 10px "Microsoft YaHei UI"; padding:1px 0; }
+QToolButton#foldTool:hover { color:#1F6B59; }
+QLabel#quoteTool {
+    color:#2C5F55; font:11px Consolas,"Microsoft YaHei UI",monospace;
+    background:#EFF8F5; border-left:3px solid #A9D9CD; border-radius:4px; padding:6px 8px;
+}
 QLabel#title { color:#302C40; font:600 15px "Microsoft YaHei UI"; }
 QLabel#hint { color:#9993A5; font:10px "Microsoft YaHei UI"; }
 QLabel#section { color:#625D70; font:600 11px "Microsoft YaHei UI"; }

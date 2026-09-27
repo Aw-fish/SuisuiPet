@@ -12,10 +12,11 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
     QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
 )
-from app import characters, devtools
+from app import characters, devtools, paths
 from app.conversation.service import check_connection
 from app.config import BASE_SYSTEM_PROMPT, load_settings, save_settings
 from app.pet.emotion import DEFAULT_SENSITIVITY, mood_timing
+from app.skills.sing import DEFAULT_INTERVAL_MS, INTERVAL_RANGE, audio_paths, note_name
 from app.ui.dev_window import DevWindow
 from app.ui.dialogs import StyledDialog, WheelGuard, block_wheel
 from app.ui.icons import app_icon
@@ -155,7 +156,7 @@ class SettingsWindow(QMainWindow):
         nav.addSpacing(24)
         self.stack = QStackedWidget()
         self.group = QButtonGroup(self)
-        for i, title in enumerate(("角色设置", "模式设置", "工具", "开发者")):
+        for i, title in enumerate(("角色设置", "模式设置", "工具", "技能", "开发者")):
             button = QPushButton(title, objectName="nav")
             button.setCheckable(True)
             button.clicked.connect(lambda checked=False, index=i: self.show_page(index))
@@ -178,6 +179,7 @@ class SettingsWindow(QMainWindow):
         self.stack.addWidget(self._character_page())
         self.stack.addWidget(self._mode_page())
         self.stack.addWidget(self._tools_page())
+        self.stack.addWidget(self._skills_page())
         self.stack.addWidget(self._developer_page())
         content_layout.addWidget(self.stack, 1)
         save = QPushButton("保存设置", objectName="save")
@@ -501,6 +503,99 @@ class SettingsWindow(QMainWindow):
     def _on_notes_opacity_changed(self, value: int) -> None:
         self.notes_opacity_value.setText(f"{value}%")
 
+    def _skills_page(self) -> QWidget:
+        page, layout = self._page(
+            "技能",
+            "让角色自己动手的能力：模型判断需要时才会去调用，你在开发者面板里能看到它查了什么、拿回什么。",
+        )
+        layout.addWidget(self._label("天气查询"))
+        self.weather_enabled = QCheckBox("允许角色查天气")
+        self.weather_enabled.setToolTip("关掉后连工具说明都不会发给模型，它就无从调用")
+        self.weather_enabled.toggled.connect(self._on_weather_toggled)
+        layout.addWidget(self.weather_enabled)
+        layout.addWidget(QLabel("数据来自 Open-Meteo，免 Key，需要能上网。", objectName="hint"))
+        layout.addSpacing(18)
+        layout.addWidget(self._label("默认城市（可留空）"))
+        self.weather_city = QLineEdit()
+        self.weather_city.setPlaceholderText("例如：上海")
+        layout.addWidget(self.weather_city)
+        layout.addWidget(QLabel(
+            "用户没说到城市时用它。留空就让角色先问你在哪儿；你在对话里说过的城市会记进长期记忆，"
+            "角色下次会照着用——也可以随时在对话里换一个城市。",
+            objectName="hint",
+        ))
+        layout.addSpacing(24)
+        layout.addWidget(self._label("唱歌"))
+        self.sing_enabled = QCheckBox("允许角色唱歌")
+        self.sing_enabled.setToolTip("关掉后连工具说明都不会发给模型，它就无从调用")
+        self.sing_enabled.toggled.connect(self._on_sing_toggled)
+        layout.addWidget(self.sing_enabled)
+        layout.addWidget(QLabel(
+            f"把音效放进 {paths.AUDIO_DIR}：1.mp3 ~ 8.mp3（简谱 1=do、2=re、…、7=si、8=高音 do），"
+            "每个约 1 秒。也认唱名命名（do.mp3 / sol.mp3 / do2.mp3）。",
+            objectName="hint",
+        ))
+        self.sing_files = QLabel("", objectName="hint")
+        self.sing_files.setWordWrap(True)
+        layout.addWidget(self.sing_files)
+        layout.addWidget(self._label("音符间隔"))
+        interval_row = QHBoxLayout()
+        interval_row.setSpacing(10)
+        self.sing_interval = QSlider(Qt.Horizontal)
+        self.sing_interval.setRange(*INTERVAL_RANGE)
+        self.sing_interval.setSingleStep(50)
+        self.sing_interval.setFixedHeight(24)
+        self.sing_interval.valueChanged.connect(self._on_sing_interval_changed)
+        self.sing_interval_value = QLabel(objectName="chip")
+        self.sing_interval_value.setAlignment(Qt.AlignCenter)
+        self.sing_interval_value.setFixedWidth(64)
+        interval_row.addWidget(self.sing_interval, 1)
+        interval_row.addWidget(self.sing_interval_value)
+        layout.addLayout(interval_row)
+        layout.addWidget(QLabel(
+            "音效长约 1 秒：间隔越短越连成旋律，越长越像一个个单音。"
+            "速度通常由模型按曲子的情绪自己定（抒情慢、欢快快），这里填的是它没说时用的默认值。",
+            objectName="hint",
+        ))
+        layout.addWidget(self._label("音量"))
+        volume_row = QHBoxLayout()
+        volume_row.setSpacing(10)
+        self.sing_volume = QSlider(Qt.Horizontal)
+        self.sing_volume.setRange(0, 100)
+        self.sing_volume.setSingleStep(5)
+        self.sing_volume.setFixedHeight(24)
+        self.sing_volume.valueChanged.connect(self._on_sing_volume_changed)
+        self.sing_volume_value = QLabel(objectName="chip")
+        self.sing_volume_value.setAlignment(Qt.AlignCenter)
+        self.sing_volume_value.setFixedWidth(52)
+        volume_row.addWidget(self.sing_volume, 1)
+        volume_row.addWidget(self.sing_volume_value)
+        layout.addLayout(volume_row)
+        layout.addStretch()
+        return page
+
+    def _on_weather_toggled(self, checked: bool) -> None:
+        self.weather_city.setEnabled(checked)
+
+    def _on_sing_toggled(self, checked: bool) -> None:
+        for widget in (self.sing_interval, self.sing_interval_value, self.sing_volume, self.sing_volume_value):
+            widget.setEnabled(checked)
+
+    def _on_sing_interval_changed(self, value: int) -> None:
+        self.sing_interval_value.setText(f"{value} 毫秒")
+
+    def _on_sing_volume_changed(self, value: int) -> None:
+        self.sing_volume_value.setText(f"{value}%")
+
+    def _refresh_sing_files(self) -> None:
+        """提示现在认得几个音——八个放齐才唱得完整。"""
+        found = sorted(audio_paths())
+        if not found:
+            self.sing_files.setText("这个目录里还没有可用的音效（放几个进去就能唱了）。")
+            return
+        names = "、".join(f"{note}({note_name(note)})" for note in found)
+        self.sing_files.setText(f"已经认出 {len(found)} 个音：{names}")
+
     def _developer_page(self) -> QWidget:
         page, layout = self._page("开发者", "调试用的观察窗口：看模型实际收到了什么，以及程序正在做什么。")
         self.developer_enabled = QCheckBox("启用开发者面板")
@@ -518,6 +613,7 @@ class SettingsWindow(QMainWindow):
             "· 每次请求真正发出去的消息：system 只铺一次，其余只追加新增的几条；",
             "· 条数与 token 估算、模型与温度、首字延迟与总耗时、是否被打断；",
             "· 模型的深度思考收在可折叠的区块里，推理期间实时长出来；",
+            "· 技能调用：模型要查什么、参数是什么、本地跑了多久、拿回什么；",
             "· 运行日志：发请求、打断、请求失败、记忆整理的结果都会记一行（另存本地文件）。",
         ):
             hint = QLabel(line, objectName="hint")
@@ -852,6 +948,26 @@ class SettingsWindow(QMainWindow):
         self.notes_corner.setChecked(position == "corner")
         self.notes_center.setChecked(position == "center")
         self.notes_pet.setChecked(position not in ("corner", "center"))
+        weather = (self.data.get("skills", {}) or {}).get("weather", {}) or {}
+        self.weather_enabled.setChecked(bool(weather.get("enabled", True)))
+        self.weather_city.setText(str(weather.get("city", "")))
+        self._on_weather_toggled(self.weather_enabled.isChecked())
+        singing = (self.data.get("skills", {}) or {}).get("sing", {}) or {}
+        self.sing_enabled.setChecked(bool(singing.get("enabled", True)))
+        try:
+            interval = int(singing.get("interval_ms", DEFAULT_INTERVAL_MS))
+        except (TypeError, ValueError):
+            interval = DEFAULT_INTERVAL_MS
+        self.sing_interval.setValue(interval)
+        self._on_sing_interval_changed(self.sing_interval.value())
+        try:
+            volume = int(singing.get("volume", 100))
+        except (TypeError, ValueError):
+            volume = 100
+        self.sing_volume.setValue(max(0, min(100, volume)))
+        self._on_sing_volume_changed(self.sing_volume.value())
+        self._on_sing_toggled(self.sing_enabled.isChecked())
+        self._refresh_sing_files()
         # 开发者开关：这里只同步界面，真正开启由 PetWindow 按同样的设置执行，
         # 免得"启动时看到开关是开的"就顺手把面板弹出来
         enabled = bool(self.data.get("developer", {}).get("enabled", False))
@@ -885,6 +1001,17 @@ class SettingsWindow(QMainWindow):
                 else ("center" if self.notes_center.isChecked() else "pet")
             ),
         })
+        self.data["skills"] = {
+            "weather": {
+                "enabled": self.weather_enabled.isChecked(),
+                "city": self.weather_city.text().strip(),
+            },
+            "sing": {
+                "enabled": self.sing_enabled.isChecked(),
+                "interval_ms": self.sing_interval.value(),
+                "volume": self.sing_volume.value(),
+            },
+        }
         self.data.setdefault("developer", {})["enabled"] = self.developer_enabled.isChecked()
         self._flush_characters()
         save_settings(self.data)

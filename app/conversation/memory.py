@@ -27,6 +27,7 @@ from app.conversation.message import (
     EVENT_HINT,
     INTERRUPT_HINT,
     NARRATION_HINT,
+    PREFIX_HINT,
     Message,
     ROLE_ASSISTANT,
     ROLE_SYSTEM,
@@ -277,7 +278,7 @@ class MemoryStore:
         with self.session_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(message.to_record(), ensure_ascii=False) + "\n")
 
-    def append_user(self, text: str) -> Message:
+    def append_user(self, text: str, prefix: str = "") -> Message:
         """落盘一条用户消息，并在该"对表"的时候把「现在时间」旁白挂到它身上。
 
         旁白在**写的时候**就定下来（而不是每次发请求现加）：它会随消息一起落盘，
@@ -287,7 +288,7 @@ class MemoryStore:
         什么时候该挂见 :meth:`_time_narration`——第一轮，或距上一条用户消息超过
         ``NARRATION_GAP_MINUTES``；同一段对话里连着聊就不重复挂。
         """
-        message = Message(role=ROLE_USER, content=text)
+        message = Message(role=ROLE_USER, content=text, prefix=str(prefix or "").strip())
         history = [item for item in self.load() if item.role in (ROLE_USER, ROLE_ASSISTANT)]
         message.narration = self._time_narration(history + [message])
         self.append(message)
@@ -783,6 +784,9 @@ class MemoryStore:
             for message in self.load()
             if message.role in (ROLE_USER, ROLE_ASSISTANT)
             and (message.content.strip() or message.interrupted)
+            # 工具轮次不进上下文：助手侧的 tool_calls 必须与紧随其后的 tool 结果成对出现，
+            # 只带一条过去接口会直接拒掉；而且那一轮查到的东西已经落在它的回复里了
+            and not message.tool_calls
         ]
         recent = history[-max(1, limit):]
         sections: list[str] = []
@@ -797,6 +801,9 @@ class MemoryStore:
         if any(message.event for message in recent):
             # 只有窗口里真的带着事件行时才解释这套标记，平时不花这份 token
             marks.append(EVENT_HINT)
+        if any(message.prefix for message in recent):
+            # 动作前缀（[打断唱歌] 这类）同理：出现时才解释它是怎么回事
+            marks.append(PREFIX_HINT)
         if marks:
             sections.append(f"{prompts.MARKS}\n" + "\n".join(marks))
         if any(message.interrupted for message in recent):

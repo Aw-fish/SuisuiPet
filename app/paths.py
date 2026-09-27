@@ -27,3 +27,5 @@ ICON_PNG_PATH = DATA_DIR / "icon.png"
 DEVTOOLS_LOG_PATH = DATA_DIR / "devtools.log"
 #: 记事板内容（纯文本，本地文件，不进版本控制）
 NOTES_PATH = DATA_DIR / "notes.md"
+#: 唱歌技能的音效目录（用户自己放 1.mp3 ~ 8.mp3，见目录里的说明文件）
+AUDIO_DIR = DATA_DIR / "audio"
